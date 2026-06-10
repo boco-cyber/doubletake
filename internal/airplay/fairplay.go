@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"doubletake/internal/fpemu"
@@ -12,6 +13,8 @@ import (
 
 // fairPlayM1 is the fixed m1 blob that matches the snapshot state.
 var fairPlayM1 = mustDecodeHexFP("46504c590301010000000004020003bb")
+
+var ErrFairPlayUnsupported = errors.New("receiver does not support FairPlay SAP")
 
 func mustDecodeHexFP(s string) []byte {
 	b, err := hex.DecodeString(s)
@@ -24,6 +27,10 @@ func mustDecodeHexFP(s string) []byte {
 // FairPlaySetup performs the complete FairPlay SAP handshake using the
 // standalone ARM64 interpreter.
 func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
+	if c.info != nil && !c.info.SupportsFairPlaySAP() {
+		return fmt.Errorf("%w: FPSAP feature bit is not advertised (features=0x%x)", ErrFairPlayUnsupported, c.info.Features)
+	}
+
 	dbg("[FP] starting FairPlay SAP handshake...")
 
 	// Phase 1: Send m1, receive m2
@@ -34,6 +41,10 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	m2, err := c.httpRequest("POST", "/fp-setup", "application/octet-stream", m1,
 		map[string]string{"X-Apple-ET": "32"})
 	if err != nil {
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == 404 {
+			return fmt.Errorf("%w: /fp-setup returned 404", ErrFairPlayUnsupported)
+		}
 		return fmt.Errorf("fp-setup phase 1 (m1): %w", err)
 	}
 
@@ -61,6 +72,10 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	m4, err := c.httpRequest("POST", "/fp-setup", "application/octet-stream", m3,
 		map[string]string{"X-Apple-ET": "32"})
 	if err != nil {
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == 404 {
+			return fmt.Errorf("%w: /fp-setup returned 404 during phase 2", ErrFairPlayUnsupported)
+		}
 		return fmt.Errorf("fp-setup phase 2 (m3): %w", err)
 	}
 
