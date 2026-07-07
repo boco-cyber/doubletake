@@ -87,40 +87,12 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 
 	encoderParts := detectGstEncoder(cfg)
 
-	// Single GStreamer pipeline: capture from the PipeWire portal and encode to
-	// H.264.
-	//   - vapostproc imports the portal's DMA-BUF via VA-API (plain videoconvert
-	//     fails to negotiate DMA-BUF on many drivers, giving a black screen).
-	//   - format=I420 forces 4:2:0 — RGB screens otherwise make x264enc emit
-	//     "High 4:4:4 Predictive", which most receiver decoders reject (black).
-	//   - videorate re-stamps buffers onto a regular fps timeline: the portal can
-	//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true never
-	//     duplicates frames during idle periods (no wasted bandwidth on a static
-	//     screen); skip-to-first avoids buffering before the first frame.
-	// The stream is encoded at the portal's native resolution; we do not rescale
-	// because the captured surface size is whatever the compositor hands us. The
-	// actual encoded dimensions are read back from the H.264 SPS downstream.
+	vapostprocOK := vapostprocAvailable()
+	if !vapostprocOK {
+		log.Printf("[CAPTURE] vapostproc not available (VA-API driver not working); falling back to videoconvert only, which may show a black screen on some drivers")
+	}
 	const pwFdNum = 3
-	gstArgs := []string{
-		"--quiet",
-		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
-		"!", "vapostproc",
-		"!", "video/x-raw,format=I420",
-		"!", "videoconvert",
-		"!", "videorate", "drop-only=true", "skip-to-first=true",
-		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
-		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-	}
-	if encoderParts.needsVulkan {
-		gstArgs = append(gstArgs, "!", "vulkanupload")
-	}
-	gstArgs = append(gstArgs, "!")
-	gstArgs = append(gstArgs, encoderParts.parts...)
-	gstArgs = append(gstArgs,
-		"!", "h264parse", "config-interval=-1",
-		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
+	gstArgs := buildWaylandGstArgs(pwFdNum, nodeID, fps, encoderParts, vapostprocOK)
 
 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -159,6 +131,59 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	}()
 
 	return capture, nil
+}
+
+// vapostprocAvailable reports whether GStreamer's "va" plugin has registered
+// the vapostproc element. The plugin library can be installed yet register
+// zero elements when its VA-API driver fails to initialize (e.g. NVIDIA GPUs
+// without a working VA-API driver), so this probes at runtime rather than
+// assuming availability from the package being present.
+func vapostprocAvailable() bool {
+	return exec.Command("gst-inspect-1.0", "vapostproc").Run() == nil
+}
+
+// buildWaylandGstArgs assembles the gst-launch-1.0 pipeline that captures
+// from the PipeWire portal and encodes to H.264.
+//   - vapostproc imports the portal's DMA-BUF via VA-API (plain videoconvert
+//     fails to negotiate DMA-BUF on many drivers, giving a black screen); it
+//     is only included when vapostprocOK, since on some drivers the element
+//     isn't registered at all and gst-launch would fail outright.
+//   - format=I420 forces 4:2:0 — RGB screens otherwise make x264enc emit
+//     "High 4:4:4 Predictive", which most receiver decoders reject (black).
+//   - videorate re-stamps buffers onto a regular fps timeline: the portal can
+//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true never
+//     duplicates frames during idle periods (no wasted bandwidth on a static
+//     screen); skip-to-first avoids buffering before the first frame.
+//
+// The stream is encoded at the portal's native resolution; we do not rescale
+// because the captured surface size is whatever the compositor hands us. The
+// actual encoded dimensions are read back from the H.264 SPS downstream.
+func buildWaylandGstArgs(pwFdNum int, nodeID uint32, fps int, encoderParts encoderResult, vapostprocOK bool) []string {
+	gstArgs := []string{
+		"--quiet",
+		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
+	}
+	if vapostprocOK {
+		gstArgs = append(gstArgs, "!", "vapostproc")
+	}
+	gstArgs = append(gstArgs,
+		"!", "video/x-raw,format=I420",
+		"!", "videoconvert",
+		"!", "videorate", "drop-only=true", "skip-to-first=true",
+		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
+		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
+	)
+	if encoderParts.needsVulkan {
+		gstArgs = append(gstArgs, "!", "vulkanupload")
+	}
+	gstArgs = append(gstArgs, "!")
+	gstArgs = append(gstArgs, encoderParts.parts...)
+	gstArgs = append(gstArgs,
+		"!", "h264parse", "config-interval=-1",
+		"!", "video/x-h264,stream-format=byte-stream,alignment=au",
+		"!", "fdsink", "fd=1", "sync=false", "async=false",
+	)
+	return gstArgs
 }
 
 func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {

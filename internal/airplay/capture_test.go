@@ -1,6 +1,9 @@
 package airplay
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRecommendedBitrateKbps(t *testing.T) {
 	tests := []struct {
@@ -63,6 +66,35 @@ func TestKeyframeIntervalFrames(t *testing.T) {
 	if got := keyframeIntervalFrames(0); got != 120 {
 		t.Fatalf("keyframeIntervalFrames(0) = %d, want 120", got)
 	}
+}
+
+func TestBuildWaylandGstArgsSkipsMissingVapostproc(t *testing.T) {
+	encoder := encoderResult{parts: []string{"x264enc"}}
+
+	withVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, true)
+	if !containsArg(withVapostproc, "vapostproc") {
+		t.Fatalf("expected pipeline to include vapostproc when available: %s", strings.Join(withVapostproc, " "))
+	}
+
+	withoutVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, false)
+	if containsArg(withoutVapostproc, "vapostproc") {
+		t.Fatalf("expected pipeline to omit vapostproc when unavailable: %s", strings.Join(withoutVapostproc, " "))
+	}
+	if !containsArg(withoutVapostproc, "videoconvert") {
+		t.Fatalf("expected pipeline to still include videoconvert when vapostproc unavailable: %s", strings.Join(withoutVapostproc, " "))
+	}
+	if !containsArg(withoutVapostproc, "pipewiresrc") {
+		t.Fatalf("expected pipeline to still capture from pipewiresrc: %s", strings.Join(withoutVapostproc, " "))
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestVbvBufferKbit(t *testing.T) {
