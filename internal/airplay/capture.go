@@ -56,6 +56,8 @@ type ScreenCapture struct {
 	waitCh   chan struct{} // closed when process exits
 	waitErr  error         // set before waitCh is closed
 	stopped  bool
+
+	virtualCleanup func() error // tears down a created virtual monitor, if any; nil otherwise
 }
 
 // StartCapture detects the display server (Wayland or X11) and initiates screen
@@ -215,9 +217,10 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	// Determine which region of the X screen to capture. ximagesrc captures
 	// the full X screen (all monitors combined) by default, so we crop to a
 	// single monitor's geometry — auto-detected (empty ScreenID, preserving
-	// the original behavior) or explicitly named. The encoded resolution is
-	// then that monitor's native resolution (no rescaling).
-	startX, startY, endX, endY, err := resolveX11CaptureRegion(display, cfg)
+	// the original behavior), a created virtual monitor, or an explicitly
+	// named output. The encoded resolution is that monitor's native
+	// resolution (no rescaling).
+	startX, startY, endX, endY, virtualCleanup, err := resolveX11CaptureRegion(display, cfg)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -260,6 +263,9 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		if virtualCleanup != nil {
+			virtualCleanup()
+		}
 		return nil, fmt.Errorf("gst stdout pipe: %w", err)
 	}
 	stderr, _ := cmd.StderrPipe()
@@ -269,20 +275,27 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 		if encoder.needsVulkan {
 			log.Printf("[CAPTURE] vulkanh264enc pipeline failed, falling back to x264enc")
 			cancel()
+			if virtualCleanup != nil {
+				virtualCleanup()
+			}
 			cfg.HWAccel = "none"
 			return startX11Capture(ctx, cfg)
 		}
 		cancel()
+		if virtualCleanup != nil {
+			virtualCleanup()
+		}
 		return nil, fmt.Errorf("start gst-launch: %w", err)
 	}
 
 	go logStderr("GST", stderr)
 
 	capture := &ScreenCapture{
-		cmd:    cmd,
-		stdout: stdout,
-		cancel: cancel,
-		waitCh: make(chan struct{}),
+		cmd:            cmd,
+		stdout:         stdout,
+		cancel:         cancel,
+		waitCh:         make(chan struct{}),
+		virtualCleanup: virtualCleanup,
 	}
 	go func() {
 		capture.waitErr = cmd.Wait()
@@ -333,6 +346,12 @@ func (sc *ScreenCapture) Stop() {
 			_ = sc.cmd.Process.Kill()
 		}
 		<-sc.waitCh
+	}
+
+	if sc.virtualCleanup != nil {
+		if err := sc.virtualCleanup(); err != nil {
+			log.Printf("[CAPTURE] warning: failed to tear down virtual monitor: %v", err)
+		}
 	}
 }
 
@@ -485,26 +504,114 @@ func parseCvtOutput(output string) (modeName string, params []string, err error)
 	return "", nil, fmt.Errorf("cvt output did not contain a Modeline: %s", output)
 }
 
+// computeModeline runs `cvt` to compute an xrandr modeline for the given
+// resolution and refresh rate.
+func computeModeline(width, height, fps int) (modeName string, params []string, err error) {
+	out, err := exec.Command("cvt", strconv.Itoa(width), strconv.Itoa(height), strconv.Itoa(fps)).Output()
+	if err != nil {
+		return "", nil, fmt.Errorf("cvt: %w", err)
+	}
+	return parseCvtOutput(string(out))
+}
+
+// createVirtualMonitor enables the given disconnected output as a new
+// virtual monitor at (x, y) with the given resolution/refresh rate, via
+// xrandr --newmode/--addmode/--output. If any step fails, it rolls back
+// whatever steps already succeeded before returning the error. On success,
+// the returned cleanup function reverses all of it (turns the output back
+// off and removes the added mode), restoring the output to its original
+// disconnected state.
+func createVirtualMonitor(display, output string, width, height, fps, x, y int) (cleanup func() error, err error) {
+	modeName, params, err := computeModeline(width, height, fps)
+	if err != nil {
+		return nil, fmt.Errorf("compute modeline: %w", err)
+	}
+
+	var applied []func()
+	rollback := func() {
+		for i := len(applied) - 1; i >= 0; i-- {
+			applied[i]()
+		}
+	}
+
+	newmodeArgs := append([]string{"--display", display, "--newmode", modeName}, params...)
+	if out, err := exec.Command("xrandr", newmodeArgs...).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("xrandr --newmode: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	applied = append(applied, func() {
+		exec.Command("xrandr", "--display", display, "--rmmode", modeName).Run()
+	})
+
+	if out, err := exec.Command("xrandr", "--display", display, "--addmode", output, modeName).CombinedOutput(); err != nil {
+		rollback()
+		return nil, fmt.Errorf("xrandr --addmode: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	applied = append(applied, func() {
+		exec.Command("xrandr", "--display", display, "--delmode", output, modeName).Run()
+	})
+
+	posArg := fmt.Sprintf("%dx%d", x, y)
+	if out, err := exec.Command("xrandr", "--display", display,
+		"--output", output, "--mode", modeName, "--pos", posArg).CombinedOutput(); err != nil {
+		rollback()
+		return nil, fmt.Errorf("xrandr --output: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	return func() error {
+		exec.Command("xrandr", "--display", display, "--output", output, "--off").Run()
+		exec.Command("xrandr", "--display", display, "--delmode", output, modeName).Run()
+		exec.Command("xrandr", "--display", display, "--rmmode", modeName).Run()
+		return nil
+	}, nil
+}
+
 // resolveX11CaptureRegion determines which region of the X screen to
 // capture based on cfg.ScreenID: empty auto-detects the primary monitor
-// (preserving prior behavior), any other value selects that connected
-// output by name (Task 5 adds a "virtual" case here).
-func resolveX11CaptureRegion(display string, cfg CaptureConfig) (startX, startY, endX, endY int, err error) {
+// (preserving prior behavior), "virtual" creates a virtual monitor
+// extending the desktop, and any other value selects that connected
+// output by name. The returned cleanup, if non-nil, must be called when
+// capture stops to tear down a created virtual monitor.
+func resolveX11CaptureRegion(display string, cfg CaptureConfig) (startX, startY, endX, endY int, cleanup func() error, err error) {
 	if cfg.ScreenID == "" {
 		startX, startY, endX, endY = detectPrimaryMonitor(display)
-		return startX, startY, endX, endY, nil
+		return startX, startY, endX, endY, nil, nil
 	}
 
 	monitors, err := ListX11Monitors(display)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("list screens: %w", err)
+		return 0, 0, 0, 0, nil, fmt.Errorf("list screens: %w", err)
+	}
+
+	if cfg.ScreenID == "virtual" {
+		outputName, ok := FindVirtualCandidate(monitors)
+		if !ok {
+			return 0, 0, 0, 0, nil, fmt.Errorf("no virtual/dummy output available; on NVIDIA this should be automatic (VIRTUAL1-8), on Intel/AMD configure xf86-video-dummy in xorg.conf (requires an X restart) — see README")
+		}
+		primary, ok := primaryOrFirstConnected(monitors)
+		if !ok {
+			return 0, 0, 0, 0, nil, fmt.Errorf("no connected monitor found to position the virtual monitor relative to")
+		}
+		fps := cfg.FPS
+		if fps <= 0 {
+			fps = 30
+		}
+		position := cfg.VirtualPosition
+		if position == "" {
+			position = "right"
+		}
+		x, y := computeVirtualPosition(primary, position, virtualScreenWidth, virtualScreenHeight)
+		vcleanup, err := createVirtualMonitor(display, outputName, virtualScreenWidth, virtualScreenHeight, fps, x, y)
+		if err != nil {
+			return 0, 0, 0, 0, nil, fmt.Errorf("create virtual monitor: %w", err)
+		}
+		return x, y, x + virtualScreenWidth, y + virtualScreenHeight, vcleanup, nil
 	}
 
 	m, ok := findMonitorByName(monitors, cfg.ScreenID)
 	if !ok {
-		return 0, 0, 0, 0, fmt.Errorf("screen %q not found; available screens: %s", cfg.ScreenID, describeConnectedNames(monitors))
+		return 0, 0, 0, 0, nil, fmt.Errorf("screen %q not found; available screens: %s", cfg.ScreenID, describeConnectedNames(monitors))
 	}
-	return m.X, m.Y, m.X + m.Width, m.Y + m.Height, nil
+	return m.X, m.Y, m.X + m.Width, m.Y + m.Height, nil, nil
 }
 
 // detectPrimaryMonitor queries xrandr to find the primary monitor's geometry.
