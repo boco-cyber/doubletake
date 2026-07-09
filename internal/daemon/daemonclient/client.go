@@ -74,6 +74,19 @@ func (c *Client) UnmuteTarget(target string) (*daemon.Response, error) {
 	return c.send(daemon.Request{Cmd: "unmute", Target: target})
 }
 
+// Screens lists available screens (physical outputs and virtual monitor
+// availability) and the currently configured screen.
+func (c *Client) Screens() (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "screens"})
+}
+
+// ScreenSet changes which screen the daemon broadcasts: a physical output
+// name, "virtual", or "auto" to restore auto-detection. Fails if any
+// stream is currently active.
+func (c *Client) ScreenSet(name string) (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "screen-set", Target: name})
+}
+
 func (c *Client) send(req daemon.Request) (*daemon.Response, error) {
 	conn, err := net.DialTimeout("unix", c.SocketPath, 5*time.Second)
 	if err != nil {

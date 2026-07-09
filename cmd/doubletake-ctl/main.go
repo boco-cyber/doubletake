@@ -73,6 +73,14 @@ func main() {
 		} else {
 			resp, err = client.Unmute()
 		}
+	case "screens":
+		resp, err = client.Screens()
+	case "screen-set":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl screen-set <name|virtual|auto>\n")
+			os.Exit(1)
+		}
+		resp, err = client.ScreenSet(args[1])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
@@ -94,5 +102,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket path] <command> [args]\n\nCommands:\n  status                      Show daemon state and all active streams\n  discover                    Discover AirPlay devices on the network\n  devices                     List cached discovered devices\n  connect [target] [pin]      Start mirroring (to target IP, or first free device)\n  pin <4-digit-PIN>           Submit PIN for a device waiting for pairing\n  disconnect [target]         Stop mirroring (all streams, or only the given IP)\n  mute [target]               Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]             Unmute mirrored audio (all streams, or only the given IP)\n\nFlags:\n  -socket path                Override daemon socket path (default: %s)\n", daemon.DefaultSocketPath())
+	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket path] <command> [args]\n\nCommands:\n  status                      Show daemon state and all active streams\n  discover                    Discover AirPlay devices on the network\n  devices                     List cached discovered devices\n  connect [target] [pin]      Start mirroring (to target IP, or first free device)\n  pin <4-digit-PIN>           Submit PIN for a device waiting for pairing\n  disconnect [target]         Stop mirroring (all streams, or only the given IP)\n  mute [target]               Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]             Unmute mirrored audio (all streams, or only the given IP)\n  screens                     List available screens and the current selection\n  screen-set <name>           Change which screen is broadcast (name, \"virtual\", or \"auto\"); fails while streaming\n\nFlags:\n  -socket path                Override daemon socket path (default: %s)\n", daemon.DefaultSocketPath())
 }
