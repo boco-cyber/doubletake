@@ -20,6 +20,8 @@ PlasmoidItem {
     property var streamList: []
     property string errorText: ""
     property var pendingCommands: (new Object())
+    property var screenList: []
+    property string currentScreen: "auto"
 
     // Sorted device list: active stream targets pinned to top, rest sorted by IP
     readonly property var sortedDeviceList: {
@@ -112,6 +114,12 @@ PlasmoidItem {
         return !!s && !!s.audio_muted
     }
 
+    function screenLabelFor(name) {
+        if (name === "auto" || name === "") return "Auto"
+        if (name === "virtual") return "Virtual Screen"
+        return name
+    }
+
     // --- Daemon communication ---
 
     P5Support.DataSource {
@@ -186,6 +194,16 @@ PlasmoidItem {
                 root.errorText = resp.error || "Discovery failed"
             }
             root.runCtl(["status"], "status")
+        } else if (action === "screens") {
+            if (resp.ok) {
+                root.screenList = resp.screens || []
+                root.currentScreen = resp.current_screen || "auto"
+            }
+        } else if (action === "screen-set") {
+            if (!resp.ok) {
+                root.errorText = resp.error || "Failed to change screen"
+            }
+            root.runCtl(["screens"], "screens")
         } else if (action === "connect" || action === "pin") {
             if (!resp.ok) {
                 root.errorText = resp.error || "Connection failed"
@@ -209,6 +227,7 @@ PlasmoidItem {
         onTriggered: {
             root.runCtl(["status"], "status")
             root.runCtl(["devices"], "discover")
+            root.runCtl(["screens"], "screens")
         }
     }
 
@@ -273,6 +292,39 @@ PlasmoidItem {
                     enabled: !root.isBusy
                     onClicked: {
                         root.runCtl(["discover"], "discover")
+                    }
+                }
+                Controls.ToolButton {
+                    id: screenButton
+                    icon.name: "video-display-symbolic"
+                    display: Controls.ToolButton.IconOnly
+                    Controls.ToolTip.text: "Screen: " + root.screenLabelFor(root.currentScreen)
+                    Controls.ToolTip.visible: hovered
+                    enabled: !root.isBusy
+                    onClicked: screenMenu.popup()
+
+                    Controls.Menu {
+                        id: screenMenu
+
+                        Controls.MenuItem {
+                            text: "Auto (primary)"
+                            checkable: true
+                            checked: root.currentScreen === "auto"
+                            onTriggered: root.runCtl(["screen-set", "auto"], "screen-set")
+                        }
+
+                        Repeater {
+                            model: root.screenList
+                            delegate: Controls.MenuItem {
+                                text: modelData.is_virtual
+                                      ? ("Virtual Screen (extend desktop)" + (modelData.available ? "" : " — unavailable"))
+                                      : (modelData.name + " (" + modelData.width + "x" + modelData.height + ")" + (modelData.primary ? " · primary" : ""))
+                                enabled: !modelData.is_virtual || modelData.available
+                                checkable: true
+                                checked: root.currentScreen === modelData.name
+                                onTriggered: root.runCtl(["screen-set", modelData.name], "screen-set")
+                            }
+                        }
                     }
                 }
                 Controls.ToolButton {
