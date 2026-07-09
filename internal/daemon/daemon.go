@@ -46,16 +46,18 @@ type StreamInfo struct {
 
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool         `json:"ok"`
-	State      State        `json:"state"`
-	Device     string       `json:"device,omitempty"`
-	DeviceIP   string       `json:"device_ip,omitempty"`
-	HasAudio   bool         `json:"has_audio"`
-	AudioMuted bool         `json:"audio_muted"`
-	NeedsPIN   bool         `json:"needs_pin,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Devices    []DeviceInfo `json:"devices,omitempty"`
-	Streams    []StreamInfo `json:"streams,omitempty"`
+	OK            bool         `json:"ok"`
+	State         State        `json:"state"`
+	Device        string       `json:"device,omitempty"`
+	DeviceIP      string       `json:"device_ip,omitempty"`
+	HasAudio      bool         `json:"has_audio"`
+	AudioMuted    bool         `json:"audio_muted"`
+	NeedsPIN      bool         `json:"needs_pin,omitempty"`
+	Error         string       `json:"error,omitempty"`
+	Devices       []DeviceInfo `json:"devices,omitempty"`
+	Streams       []StreamInfo `json:"streams,omitempty"`
+	Screens       []ScreenInfo `json:"screens,omitempty"`
+	CurrentScreen string       `json:"current_screen,omitempty"`
 }
 
 // DeviceInfo is a simplified view of a discovered AirPlay device.
@@ -67,19 +69,33 @@ type DeviceInfo struct {
 	DeviceID string `json:"device_id"`
 }
 
+// ScreenInfo describes one screen available to broadcast: either a physical
+// monitor or the synthetic "virtual" entry representing an on-demand
+// virtual monitor.
+type ScreenInfo struct {
+	Name      string `json:"name"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+	Primary   bool   `json:"primary,omitempty"`
+	IsVirtual bool   `json:"is_virtual,omitempty"`
+	Available bool   `json:"available"`
+}
+
 // Config holds daemon configuration.
 type Config struct {
-	SocketPath  string
-	CredFile    string
-	CredBackend string
-	FPS         int
-	Bitrate     int
-	HWAccel     string
-	Debug       bool
-	TestMode    bool
-	NoEncrypt   bool
-	DirectKey   bool
-	NoAudio     bool
+	SocketPath      string
+	CredFile        string
+	CredBackend     string
+	FPS             int
+	Bitrate         int
+	HWAccel         string
+	ScreenID        string
+	VirtualPosition string
+	Debug           bool
+	TestMode        bool
+	NoEncrypt       bool
+	DirectKey       bool
+	NoAudio         bool
 }
 
 // DefaultSocketPath returns the default socket path using XDG_RUNTIME_DIR.
@@ -298,6 +314,10 @@ func (d *Daemon) handleRequest(req Request) Response {
 		return d.handleDiscover()
 	case "devices":
 		return d.handleDevices()
+	case "screens":
+		return d.handleScreens()
+	case "screen-set":
+		return d.handleScreenSet(req)
 	case "connect":
 		return d.handleConnect(req)
 	case "disconnect":
@@ -405,6 +425,63 @@ func (d *Daemon) handleDevices() Response {
 		State:   d.overallStateLocked(),
 		Devices: toDeviceInfos(d.devices),
 	}
+}
+
+// screenIDForDisplay normalizes an internal ScreenID for display/API
+// purposes: the empty string (auto-detect) is shown as "auto".
+func screenIDForDisplay(id string) string {
+	if id == "" {
+		return "auto"
+	}
+	return id
+}
+
+func (d *Daemon) handleScreens() Response {
+	d.mu.Lock()
+	current := screenIDForDisplay(d.cfg.ScreenID)
+	overall := d.overallStateLocked()
+	d.mu.Unlock()
+
+	var screens []ScreenInfo
+	if os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") != "" {
+		monitors, err := airplay.ListX11Monitors(os.Getenv("DISPLAY"))
+		if err != nil {
+			return Response{OK: false, State: overall, Error: fmt.Sprintf("list screens: %v", err)}
+		}
+		for _, m := range monitors {
+			if !m.Connected {
+				continue
+			}
+			screens = append(screens, ScreenInfo{
+				Name:      m.Name,
+				Width:     m.Width,
+				Height:    m.Height,
+				Primary:   m.Primary,
+				Available: true,
+			})
+		}
+		_, virtualOK := airplay.FindVirtualCandidate(monitors)
+		screens = append(screens, ScreenInfo{Name: "virtual", IsVirtual: true, Available: virtualOK})
+	}
+
+	return Response{OK: true, State: overall, Screens: screens, CurrentScreen: current}
+}
+
+func (d *Daemon) handleScreenSet(req Request) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.streams) > 0 {
+		return Response{OK: false, State: d.overallStateLocked(), Error: "stop streaming before changing screen"}
+	}
+
+	screen := req.Target
+	if screen == "auto" {
+		screen = ""
+	}
+	d.cfg.ScreenID = screen
+
+	return Response{OK: true, State: d.overallStateLocked(), CurrentScreen: screenIDForDisplay(d.cfg.ScreenID)}
 }
 
 func (d *Daemon) handleConnect(req Request) Response {
@@ -711,6 +788,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airplay.BroadcastSink, error) {
 	d.mu.Lock()
 	bc := d.broadcast
+	screenID := d.cfg.ScreenID
+	virtualPosition := d.cfg.VirtualPosition
 	d.mu.Unlock()
 
 	if bc != nil {
@@ -721,10 +800,12 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 
 	// Start a fresh screen capture.
 	capCfg := airplay.CaptureConfig{
-		FPS:          d.cfg.FPS,
-		Bitrate:      d.cfg.Bitrate,
-		HWAccel:      d.cfg.HWAccel,
-		RestoreToken: restoreToken,
+		FPS:             d.cfg.FPS,
+		Bitrate:         d.cfg.Bitrate,
+		HWAccel:         d.cfg.HWAccel,
+		ScreenID:        screenID,
+		VirtualPosition: virtualPosition,
+		RestoreToken:    restoreToken,
 	}
 	if deviceID != "" {
 		capCfg.SaveRestoreToken = func(token string) error {

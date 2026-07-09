@@ -87,7 +87,7 @@ func main() {
 	airplay.DebugMode = *debug
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *screen, *virtualPosition, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
 		return
 	}
 
@@ -447,19 +447,21 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio bool) {
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel, screen, virtualPosition string, debug, testMode, noEncrypt, directKey, noAudio bool) {
 	cfg := daemon.Config{
-		SocketPath:  socketPath,
-		CredFile:    credFile,
-		CredBackend: credBackend,
-		FPS:         fps,
-		Bitrate:     bitrate,
-		HWAccel:     hwaccel,
-		Debug:       debug,
-		TestMode:    testMode,
-		NoEncrypt:   noEncrypt,
-		DirectKey:   directKey,
-		NoAudio:     noAudio,
+		SocketPath:      socketPath,
+		CredFile:        credFile,
+		CredBackend:     credBackend,
+		FPS:             fps,
+		Bitrate:         bitrate,
+		HWAccel:         hwaccel,
+		ScreenID:        screen,
+		VirtualPosition: virtualPosition,
+		Debug:           debug,
+		TestMode:        testMode,
+		NoEncrypt:       noEncrypt,
+		DirectKey:       directKey,
+		NoAudio:         noAudio,
 	}
 
 	d, err := daemon.New(cfg)
