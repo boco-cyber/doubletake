@@ -321,57 +321,84 @@ func (sc *ScreenCapture) Stop() {
 	}
 }
 
+// MonitorInfo describes one X11 RandR output as reported by xrandr.
+type MonitorInfo struct {
+	Name          string
+	Connected     bool
+	Primary       bool
+	X, Y          int
+	Width, Height int
+}
+
+// ListX11Monitors queries xrandr for every output (connected and
+// disconnected) on the given X display.
+func ListX11Monitors(display string) ([]MonitorInfo, error) {
+	out, err := exec.Command("xrandr", "--display", display, "--query").Output()
+	if err != nil {
+		return nil, fmt.Errorf("xrandr query: %w", err)
+	}
+	return parseXrandrOutputs(string(out)), nil
+}
+
+// parseXrandrOutputs parses the text of `xrandr --query` into one
+// MonitorInfo per output line, skipping mode lines and the leading
+// "Screen 0: ..." line.
+func parseXrandrOutputs(output string) []MonitorInfo {
+	var monitors []MonitorInfo
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := fields[0]
+		switch {
+		case strings.Contains(line, " connected"):
+			mi := MonitorInfo{Name: name, Connected: true, Primary: strings.Contains(line, " primary ")}
+			if x, y, w, h, ok := parseXrandrGeometry(line); ok {
+				mi.X, mi.Y, mi.Width, mi.Height = x, y, w, h
+			}
+			monitors = append(monitors, mi)
+		case strings.Contains(line, " disconnected"):
+			monitors = append(monitors, MonitorInfo{Name: name, Connected: false})
+		}
+	}
+	return monitors
+}
+
+// primaryOrFirstConnected returns the primary connected monitor with known
+// geometry, or failing that the first connected monitor with known
+// geometry.
+func primaryOrFirstConnected(monitors []MonitorInfo) (MonitorInfo, bool) {
+	for _, m := range monitors {
+		if m.Connected && m.Primary && m.Width > 0 && m.Height > 0 {
+			return m, true
+		}
+	}
+	for _, m := range monitors {
+		if m.Connected && m.Width > 0 && m.Height > 0 {
+			return m, true
+		}
+	}
+	return MonitorInfo{}, false
+}
+
 // detectPrimaryMonitor queries xrandr to find the primary monitor's geometry.
 // Returns (startX, startY, endX, endY) bounding the primary monitor, where
 // endX = startX + monitor_width and endY = startY + monitor_height. If
 // detection fails it returns all zeros, meaning no cropping should be applied.
 func detectPrimaryMonitor(display string) (startX, startY, endX, endY int) {
-	// Run xrandr to get connected outputs with geometry
-	out, err := exec.Command("xrandr", "--display", display, "--query").Output()
+	monitors, err := ListX11Monitors(display)
 	if err != nil {
 		dbg("[CAPTURE] xrandr failed: %v, skipping monitor crop", err)
 		return 0, 0, 0, 0
 	}
-
-	// Parse lines like: "DP-3 connected primary 1920x1080+0+0"
-	// or "DP-1 connected 1920x1080+1920+0"
-	// Format: <name> connected [primary] <W>x<H>+<X>+<Y>
-	var px, py, pw, ph int
-	var found bool
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, " connected") {
-			continue
-		}
-		// Try primary first
-		if strings.Contains(line, " primary ") {
-			if x, y, w, h, ok := parseXrandrGeometry(line); ok {
-				px, py, pw, ph = x, y, w, h
-				found = true
-				break
-			}
-		}
-	}
-	// If no primary found, use the first connected output
-	if !found {
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.Contains(line, " connected") {
-				continue
-			}
-			if x, y, w, h, ok := parseXrandrGeometry(line); ok {
-				px, py, pw, ph = x, y, w, h
-				found = true
-				break
-			}
-		}
-	}
-
-	if !found || pw <= 0 || ph <= 0 {
+	m, ok := primaryOrFirstConnected(monitors)
+	if !ok {
 		dbg("[CAPTURE] couldn't parse xrandr output, skipping monitor crop")
 		return 0, 0, 0, 0
 	}
-
-	dbg("[CAPTURE] primary monitor: %dx%d at +%d+%d", pw, ph, px, py)
-	return px, py, px + pw, py + ph
+	dbg("[CAPTURE] primary monitor: %dx%d at +%d+%d", m.Width, m.Height, m.X, m.Y)
+	return m.X, m.Y, m.X + m.Width, m.Y + m.Height
 }
 
 // parseXrandrGeometry extracts the X/Y offset and width/height from an xrandr

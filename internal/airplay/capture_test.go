@@ -117,3 +117,57 @@ func TestVbvBufferKbit(t *testing.T) {
 		})
 	}
 }
+
+func TestParseXrandrOutputs(t *testing.T) {
+	sample := `Screen 0: minimum 320 x 200, current 3840 x 1080, maximum 16384 x 16384
+DP-3 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 531mm x 299mm
+   1920x1080     60.00*+  59.94
+DP-1 connected 1920x1080+1920+0 (normal left inverted right x axis y axis) 531mm x 299mm
+   1920x1080     60.00 +
+HDMI-1 disconnected (normal left inverted right x axis y axis)
+VIRTUAL1 disconnected (normal left inverted right x axis y axis)
+`
+	monitors := parseXrandrOutputs(sample)
+
+	want := []MonitorInfo{
+		{Name: "DP-3", Connected: true, Primary: true, X: 0, Y: 0, Width: 1920, Height: 1080},
+		{Name: "DP-1", Connected: true, Primary: false, X: 1920, Y: 0, Width: 1920, Height: 1080},
+		{Name: "HDMI-1", Connected: false},
+		{Name: "VIRTUAL1", Connected: false},
+	}
+	if len(monitors) != len(want) {
+		t.Fatalf("got %d monitors, want %d: %+v", len(monitors), len(want), monitors)
+	}
+	for i, w := range want {
+		if monitors[i] != w {
+			t.Fatalf("monitor %d = %+v, want %+v", i, monitors[i], w)
+		}
+	}
+}
+
+func TestPrimaryOrFirstConnected(t *testing.T) {
+	// Primary present picks primary even if listed second.
+	monitors := []MonitorInfo{
+		{Name: "DP-1", Connected: true, X: 1920, Y: 0, Width: 1920, Height: 1080},
+		{Name: "DP-3", Connected: true, Primary: true, X: 0, Y: 0, Width: 1920, Height: 1080},
+	}
+	got, ok := primaryOrFirstConnected(monitors)
+	if !ok || got.Name != "DP-3" {
+		t.Fatalf("primaryOrFirstConnected() = %+v, %v, want DP-3, true", got, ok)
+	}
+
+	// No primary falls back to first connected.
+	monitors = []MonitorInfo{
+		{Name: "HDMI-1", Connected: false},
+		{Name: "DP-1", Connected: true, X: 0, Y: 0, Width: 2560, Height: 1440},
+	}
+	got, ok = primaryOrFirstConnected(monitors)
+	if !ok || got.Name != "DP-1" {
+		t.Fatalf("primaryOrFirstConnected() = %+v, %v, want DP-1, true", got, ok)
+	}
+
+	// Nothing connected.
+	if _, ok := primaryOrFirstConnected(nil); ok {
+		t.Fatalf("primaryOrFirstConnected(nil) ok = true, want false")
+	}
+}
