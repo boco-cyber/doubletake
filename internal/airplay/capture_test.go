@@ -311,3 +311,23 @@ func TestParseCvtOutputNoModeline(t *testing.T) {
 		t.Fatalf("parseCvtOutput() error = nil, want error for missing Modeline")
 	}
 }
+
+func TestWaylandRequestToken(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  CaptureConfig
+		want string
+	}{
+		{"no screen override reuses saved token", CaptureConfig{RestoreToken: "saved-token"}, "saved-token"},
+		{"named screen forces fresh picker", CaptureConfig{RestoreToken: "saved-token", ScreenID: "DP-3"}, ""},
+		{"virtual screen forces fresh picker", CaptureConfig{RestoreToken: "saved-token", ScreenID: "virtual"}, ""},
+		{"no saved token, no override", CaptureConfig{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := waylandRequestToken(tt.cfg); got != tt.want {
+				t.Fatalf("waylandRequestToken(%+v) = %q, want %q", tt.cfg, got, tt.want)
+			}
+		})
+	}
+}

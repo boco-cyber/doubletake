@@ -73,13 +73,31 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 	return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
 }
 
+// waylandRequestToken returns the restore token to pass to the portal's
+// SelectSources call: the saved token normally, or empty when a screen
+// change was explicitly requested. The xdg-desktop-portal has no API to
+// select a monitor by name — passing an empty token forces its native
+// picker to reappear so the user can choose a different monitor/window
+// themselves, instead of silently reusing whatever was chosen last time.
+func waylandRequestToken(cfg CaptureConfig) string {
+	if cfg.ScreenID != "" {
+		return ""
+	}
+	return cfg.RestoreToken
+}
+
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if cfg.ScreenID == "virtual" {
+		return nil, fmt.Errorf("virtual screen capture is not yet supported on Wayland")
+	}
+
 	// Check dependencies
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
 	}
 
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken)
+	requestToken := waylandRequestToken(cfg)
+	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, requestToken)
 	if err != nil {
 		return nil, fmt.Errorf("screencast portal: %w", err)
 	}
