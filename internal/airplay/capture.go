@@ -441,6 +441,50 @@ func FindVirtualCandidate(monitors []MonitorInfo) (string, bool) {
 	return "", false
 }
 
+const (
+	// virtualScreenWidth/virtualScreenHeight is the fixed resolution used
+	// for a created virtual monitor; it mirrors the 1080p assumption
+	// already baked into auto-bitrate sizing (captureBitrateKbps).
+	virtualScreenWidth  = 1920
+	virtualScreenHeight = 1080
+)
+
+// computeVirtualPosition returns the top-left coordinate for a virtual
+// monitor of size vw x vh, placed relative to the primary monitor.
+// Unrecognized position values (including "") default to "right".
+func computeVirtualPosition(primary MonitorInfo, position string, vw, vh int) (x, y int) {
+	switch position {
+	case "left":
+		return primary.X - vw, primary.Y
+	case "above":
+		return primary.X, primary.Y - vh
+	case "below":
+		return primary.X, primary.Y + primary.Height
+	default:
+		return primary.X + primary.Width, primary.Y
+	}
+}
+
+// parseCvtOutput extracts the mode name and xrandr --newmode parameters
+// from the output of the `cvt` utility, e.g.:
+//
+//	# 1920x1080 59.96 Hz (CVT 2.07M9) hsync: 67.16 kHz; pclk: 173.00 MHz
+//	Modeline "1920x1080_30.00"  173.00  1920 2048 2248 2576  1080 1083 1088 1120 -hsync +vsync
+func parseCvtOutput(output string) (modeName string, params []string, err error) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Modeline") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		return strings.Trim(fields[1], `"`), fields[2:], nil
+	}
+	return "", nil, fmt.Errorf("cvt output did not contain a Modeline: %s", output)
+}
+
 // resolveX11CaptureRegion determines which region of the X screen to
 // capture based on cfg.ScreenID: empty auto-detects the primary monitor
 // (preserving prior behavior), any other value selects that connected

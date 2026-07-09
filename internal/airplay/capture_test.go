@@ -253,3 +253,61 @@ func TestFindVirtualCandidate(t *testing.T) {
 		})
 	}
 }
+
+func TestComputeVirtualPosition(t *testing.T) {
+	primary := MonitorInfo{X: 0, Y: 0, Width: 1920, Height: 1080}
+	tests := []struct {
+		position string
+		wantX    int
+		wantY    int
+	}{
+		{"right", 1920, 0},
+		{"", 1920, 0}, // unrecognized/default falls back to "right"
+		{"left", -1920, 0},
+		{"above", 0, -1080},
+		{"below", 0, 1080},
+	}
+	for _, tt := range tests {
+		t.Run(tt.position, func(t *testing.T) {
+			x, y := computeVirtualPosition(primary, tt.position, 1920, 1080)
+			if x != tt.wantX || y != tt.wantY {
+				t.Fatalf("computeVirtualPosition(%q) = (%d, %d), want (%d, %d)", tt.position, x, y, tt.wantX, tt.wantY)
+			}
+		})
+	}
+
+	// A non-origin primary should offset correctly too.
+	primary = MonitorInfo{X: 1920, Y: 0, Width: 2560, Height: 1440}
+	x, y := computeVirtualPosition(primary, "right", 1920, 1080)
+	if x != 4480 || y != 0 {
+		t.Fatalf("computeVirtualPosition(right) with offset primary = (%d, %d), want (4480, 0)", x, y)
+	}
+}
+
+func TestParseCvtOutput(t *testing.T) {
+	sample := `# 1920x1080 29.97 Hz (CVT 2.07M9) hsync: 33.72 kHz; pclk: 138.50 MHz
+Modeline "1920x1080_30.00"  138.50  1920 2040 2248 2576  1080 1083 1088 1118 -hsync +vsync
+`
+	name, params, err := parseCvtOutput(sample)
+	if err != nil {
+		t.Fatalf("parseCvtOutput() error = %v", err)
+	}
+	if name != "1920x1080_30.00" {
+		t.Fatalf("parseCvtOutput() name = %q, want %q", name, "1920x1080_30.00")
+	}
+	wantParams := []string{"138.50", "1920", "2040", "2248", "2576", "1080", "1083", "1088", "1118", "-hsync", "+vsync"}
+	if len(params) != len(wantParams) {
+		t.Fatalf("parseCvtOutput() params = %v, want %v", params, wantParams)
+	}
+	for i := range wantParams {
+		if params[i] != wantParams[i] {
+			t.Fatalf("parseCvtOutput() params[%d] = %q, want %q", i, params[i], wantParams[i])
+		}
+	}
+}
+
+func TestParseCvtOutputNoModeline(t *testing.T) {
+	if _, _, err := parseCvtOutput("garbage output\n"); err == nil {
+		t.Fatalf("parseCvtOutput() error = nil, want error for missing Modeline")
+	}
+}
