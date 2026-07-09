@@ -171,3 +171,40 @@ func TestPrimaryOrFirstConnected(t *testing.T) {
 		t.Fatalf("primaryOrFirstConnected(nil) ok = true, want false")
 	}
 }
+
+func TestFindMonitorByName(t *testing.T) {
+	monitors := []MonitorInfo{
+		{Name: "DP-3", Connected: true, Primary: true, X: 0, Y: 0, Width: 1920, Height: 1080},
+		{Name: "DP-1", Connected: true, X: 1920, Y: 0, Width: 2560, Height: 1440},
+		{Name: "HDMI-1", Connected: false},
+	}
+
+	m, ok := findMonitorByName(monitors, "DP-1")
+	if !ok {
+		t.Fatalf("findMonitorByName(DP-1) not found")
+	}
+	if m.X != 1920 || m.Y != 0 || m.Width != 2560 || m.Height != 1440 {
+		t.Fatalf("findMonitorByName(DP-1) = %+v, unexpected geometry", m)
+	}
+
+	if _, ok := findMonitorByName(monitors, "HDMI-1"); ok {
+		t.Fatalf("findMonitorByName(HDMI-1) unexpectedly found (disconnected)")
+	}
+	if _, ok := findMonitorByName(monitors, "DP-9"); ok {
+		t.Fatalf("findMonitorByName(DP-9) unexpectedly found (nonexistent)")
+	}
+}
+
+func TestDescribeConnectedNames(t *testing.T) {
+	monitors := []MonitorInfo{
+		{Name: "DP-3", Connected: true},
+		{Name: "HDMI-1", Connected: false},
+		{Name: "DP-1", Connected: true},
+	}
+	if got := describeConnectedNames(monitors); got != "DP-3, DP-1" {
+		t.Fatalf("describeConnectedNames() = %q, want %q", got, "DP-3, DP-1")
+	}
+	if got := describeConnectedNames(nil); got != "(none detected)" {
+		t.Fatalf("describeConnectedNames(nil) = %q, want %q", got, "(none detected)")
+	}
+}

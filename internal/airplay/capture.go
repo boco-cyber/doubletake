@@ -21,6 +21,15 @@ type CaptureConfig struct {
 	Bitrate int    // Video bitrate in kbps (0 = auto)
 	HWAccel string // "auto", "vaapi", "none"
 
+	// ScreenID selects what to capture: "" auto-detects the primary monitor
+	// (X11) or shows the portal's picker (Wayland); a name selects that
+	// connected X11 output; "virtual" requests a virtual extended-desktop
+	// monitor (X11 only).
+	ScreenID string
+	// VirtualPosition places a "virtual" ScreenID relative to the primary
+	// monitor: "left", "right", "above", or "below". Defaults to "right".
+	VirtualPosition string
+
 	RestoreToken     string
 	SaveRestoreToken func(string) error
 }
@@ -202,11 +211,16 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 
 	encoder := detectGstEncoder(cfg)
 
-	// Detect primary monitor geometry — ximagesrc captures the full X screen
-	// (all monitors combined). On multi-monitor setups this wastes CPU on pixels
-	// we don't need, so crop to the primary monitor. The encoded resolution is
-	// then the primary monitor's native resolution (no rescaling).
-	startX, startY, endX, endY := detectPrimaryMonitor(display)
+	// Determine which region of the X screen to capture. ximagesrc captures
+	// the full X screen (all monitors combined) by default, so we crop to a
+	// single monitor's geometry — auto-detected (empty ScreenID, preserving
+	// the original behavior) or explicitly named. The encoded resolution is
+	// then that monitor's native resolution (no rescaling).
+	startX, startY, endX, endY, err := resolveX11CaptureRegion(display, cfg)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	ximageSrcArgs := []string{
 		"ximagesrc", fmt.Sprintf("display-name=%s", display), "use-damage=false",
@@ -380,6 +394,54 @@ func primaryOrFirstConnected(monitors []MonitorInfo) (MonitorInfo, bool) {
 		}
 	}
 	return MonitorInfo{}, false
+}
+
+// findMonitorByName returns the connected monitor with the given output
+// name, if any.
+func findMonitorByName(monitors []MonitorInfo, name string) (MonitorInfo, bool) {
+	for _, m := range monitors {
+		if m.Connected && m.Name == name {
+			return m, true
+		}
+	}
+	return MonitorInfo{}, false
+}
+
+// describeConnectedNames returns a comma-separated list of connected output
+// names, for error messages when a requested screen isn't found.
+func describeConnectedNames(monitors []MonitorInfo) string {
+	var names []string
+	for _, m := range monitors {
+		if m.Connected {
+			names = append(names, m.Name)
+		}
+	}
+	if len(names) == 0 {
+		return "(none detected)"
+	}
+	return strings.Join(names, ", ")
+}
+
+// resolveX11CaptureRegion determines which region of the X screen to
+// capture based on cfg.ScreenID: empty auto-detects the primary monitor
+// (preserving prior behavior), any other value selects that connected
+// output by name (Task 5 adds a "virtual" case here).
+func resolveX11CaptureRegion(display string, cfg CaptureConfig) (startX, startY, endX, endY int, err error) {
+	if cfg.ScreenID == "" {
+		startX, startY, endX, endY = detectPrimaryMonitor(display)
+		return startX, startY, endX, endY, nil
+	}
+
+	monitors, err := ListX11Monitors(display)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("list screens: %w", err)
+	}
+
+	m, ok := findMonitorByName(monitors, cfg.ScreenID)
+	if !ok {
+		return 0, 0, 0, 0, fmt.Errorf("screen %q not found; available screens: %s", cfg.ScreenID, describeConnectedNames(monitors))
+	}
+	return m.X, m.Y, m.X + m.Width, m.Y + m.Height, nil
 }
 
 // detectPrimaryMonitor queries xrandr to find the primary monitor's geometry.
