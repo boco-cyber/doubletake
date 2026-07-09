@@ -208,3 +208,48 @@ func TestDescribeConnectedNames(t *testing.T) {
 		t.Fatalf("describeConnectedNames(nil) = %q, want %q", got, "(none detected)")
 	}
 }
+
+func TestFindVirtualCandidate(t *testing.T) {
+	tests := []struct {
+		name     string
+		monitors []MonitorInfo
+		want     string
+		wantOK   bool
+	}{
+		{
+			name:     "nvidia virtual output",
+			monitors: []MonitorInfo{{Name: "DP-3", Connected: true}, {Name: "VIRTUAL1", Connected: false}},
+			want:     "VIRTUAL1",
+			wantOK:   true,
+		},
+		{
+			name:     "dummy driver output",
+			monitors: []MonitorInfo{{Name: "DUMMY0", Connected: false}},
+			want:     "DUMMY0",
+			wantOK:   true,
+		},
+		{
+			name:     "connected virtual-named output is not a candidate",
+			monitors: []MonitorInfo{{Name: "VIRTUAL1", Connected: true}},
+			wantOK:   false,
+		},
+		{
+			name:     "unrelated disconnected output is not a candidate",
+			monitors: []MonitorInfo{{Name: "HDMI-1", Connected: false}},
+			wantOK:   false,
+		},
+		{
+			name:     "no monitors",
+			monitors: nil,
+			wantOK:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := FindVirtualCandidate(tt.monitors)
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("FindVirtualCandidate(%+v) = %q, %v, want %q, %v", tt.monitors, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -420,6 +421,24 @@ func describeConnectedNames(monitors []MonitorInfo) string {
 		return "(none detected)"
 	}
 	return strings.Join(names, ", ")
+}
+
+// virtualCandidatePattern matches disconnected output names that are known,
+// pre-existing "spare" outputs a driver can turn into a virtual monitor:
+// VIRTUAL1-8 (NVIDIA proprietary driver default) or DUMMY* (xf86-video-dummy
+// convention). xrandr cannot fabricate a new output, only enable one the
+// driver already exposes.
+var virtualCandidatePattern = regexp.MustCompile(`^(VIRTUAL|DUMMY)\d+$`)
+
+// FindVirtualCandidate returns the name of the first disconnected output
+// that looks like a usable virtual/dummy monitor, if any.
+func FindVirtualCandidate(monitors []MonitorInfo) (string, bool) {
+	for _, m := range monitors {
+		if !m.Connected && virtualCandidatePattern.MatchString(m.Name) {
+			return m.Name, true
+		}
+	}
+	return "", false
 }
 
 // resolveX11CaptureRegion determines which region of the X screen to
