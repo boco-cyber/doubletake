@@ -58,6 +58,9 @@ func main() {
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 100, "Target end-to-end latency in milliseconds (applies to audio and video timing)")
 	hwaccel := flag.String("hwaccel", "auto", "Hardware acceleration: auto, nvenc, vaapi, none")
+	screen := flag.String("screen", "", "Screen to capture: empty = auto-detect (X11) / portal picker (Wayland), an xrandr output name, or \"virtual\" for a virtual extended-desktop monitor")
+	virtualPosition := flag.String("virtual-position", "right", "Position of the virtual monitor relative to the primary: left, right, above, or below (only used with -screen virtual)")
+	listScreens := flag.Bool("list-screens", false, "List available screens (physical outputs and virtual monitor availability) and exit")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -67,6 +70,17 @@ func main() {
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
 	flag.Parse()
+
+	switch *virtualPosition {
+	case "left", "right", "above", "below":
+	default:
+		log.Fatalf("invalid -virtual-position %q (want left, right, above, or below)", *virtualPosition)
+	}
+
+	if *listScreens {
+		printAvailableScreens()
+		return
+	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
@@ -280,9 +294,11 @@ func main() {
 		}
 	} else {
 		captureCfg := airplay.CaptureConfig{
-			FPS:     *fps,
-			Bitrate: *bitrate,
-			HWAccel: *hwaccel,
+			FPS:             *fps,
+			Bitrate:         *bitrate,
+			HWAccel:         *hwaccel,
+			ScreenID:        *screen,
+			VirtualPosition: *virtualPosition,
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
@@ -330,6 +346,42 @@ func promptForPIN(client *airplay.AirPlayClient) string {
 	var pinVal string
 	fmt.Scanln(&pinVal)
 	return pinVal
+}
+
+// printAvailableScreens prints the screens doubletake can currently target
+// with -screen, for use with -list-screens.
+func printAvailableScreens() {
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		fmt.Println("screen listing is not available on Wayland; the desktop portal shows its own picker when you connect.")
+		fmt.Println("pass any -screen value to force that picker to reappear instead of reusing a saved choice.")
+		return
+	}
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		fmt.Println("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
+		return
+	}
+	monitors, err := airplay.ListX11Monitors(display)
+	if err != nil {
+		fmt.Printf("failed to query screens: %v\n", err)
+		return
+	}
+	fmt.Println("available screens:")
+	for _, m := range monitors {
+		if !m.Connected {
+			continue
+		}
+		marker := ""
+		if m.Primary {
+			marker = " (primary)"
+		}
+		fmt.Printf("  %s: %dx%d+%d+%d%s\n", m.Name, m.Width, m.Height, m.X, m.Y, marker)
+	}
+	if name, ok := airplay.FindVirtualCandidate(monitors); ok {
+		fmt.Printf("  virtual: available (would use output %s)\n", name)
+	} else {
+		fmt.Println("  virtual: not available (no VIRTUAL*/DUMMY* output detected; see README for setup)")
+	}
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {
