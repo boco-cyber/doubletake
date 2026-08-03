@@ -197,8 +197,8 @@ func buildWaylandGstArgs(pwFdNum int, nodeID uint32, fps int, encoderParts encod
 		gstArgs = append(gstArgs, "!", "vapostproc")
 	}
 	gstArgs = append(gstArgs,
-		"!", "videoconvert",
 		"!", "video/x-raw,format=I420",
+		"!", "videoconvert",
 		"!", "videorate", "drop-only=true", "skip-to-first=true",
 		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
 		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",

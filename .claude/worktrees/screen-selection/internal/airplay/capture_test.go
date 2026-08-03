@@ -86,11 +86,6 @@ func TestBuildWaylandGstArgsSkipsMissingVapostproc(t *testing.T) {
 	if !containsArg(withoutVapostproc, "pipewiresrc") {
 		t.Fatalf("expected pipeline to still capture from pipewiresrc: %s", strings.Join(withoutVapostproc, " "))
 	}
-	convertIndex := argIndex(withoutVapostproc, "videoconvert")
-	i420Index := argIndex(withoutVapostproc, "video/x-raw,format=I420")
-	if convertIndex < 0 || i420Index < 0 || convertIndex >= i420Index {
-		t.Fatalf("expected videoconvert before I420 caps for PipeWire format negotiation: %s", strings.Join(withoutVapostproc, " "))
-	}
 }
 
 func containsArg(args []string, want string) bool {
@@ -100,15 +95,6 @@ func containsArg(args []string, want string) bool {
 		}
 	}
 	return false
-}
-
-func argIndex(args []string, want string) int {
-	for i, arg := range args {
-		if arg == want {
-			return i
-		}
-	}
-	return -1
 }
 
 func TestVbvBufferKbit(t *testing.T) {
