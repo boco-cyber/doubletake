@@ -25,7 +25,8 @@ type CaptureConfig struct {
 	// ScreenID selects what to capture: "" auto-detects the primary monitor
 	// (X11) or shows the portal's picker (Wayland); a name selects that
 	// connected X11 output; "virtual" requests a virtual extended-desktop
-	// monitor (X11 only).
+	// monitor. On Wayland, "virtual" is routed through the desktop portal
+	// because the compositor owns virtual-output creation and selection.
 	ScreenID string
 	// VirtualPosition places a "virtual" ScreenID relative to the primary
 	// monitor: "left", "right", "above", or "below". Defaults to "right".
@@ -80,20 +81,35 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 // picker to reappear so the user can choose a different monitor/window
 // themselves, instead of silently reusing whatever was chosen last time.
 func waylandRequestToken(cfg CaptureConfig) string {
-	if cfg.ScreenID != "" {
-		return ""
-	}
-	return cfg.RestoreToken
+	_ = cfg
+	// Portal restore tokens can point at stale or no-longer-valid PipeWire
+	// sources. Until the UI can show and manage those choices explicitly,
+	// forcing the native picker is safer than connecting and immediately
+	// dropping the stream with an opaque EOF.
+	return ""
 }
 
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
 	if cfg.ScreenID == "virtual" {
-		return nil, fmt.Errorf("virtual screen capture is not yet supported on Wayland")
+		return nil, fmt.Errorf("Apple TV as an extended virtual display is not available on this GNOME Wayland session; the Wayland screencast portal can only mirror an existing screen/window. Use an Xorg session with a virtual/dummy output, or GNOME Remote Desktop's extend mode, then stream that created monitor.")
 	}
 
 	// Check dependencies
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
+	}
+	if err := requireGstElement("h264parse", "gstreamer1.0-plugins-bad"); err != nil {
+		return nil, err
+	}
+
+	fps := cfg.FPS
+	if fps <= 0 {
+		fps = 30
+	}
+
+	encoderParts := detectGstEncoder(cfg)
+	if encoderParts.err != nil {
+		return nil, encoderParts.err
 	}
 
 	requestToken := waylandRequestToken(cfg)
@@ -109,13 +125,6 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	dbg("pipewire node ID: %d", nodeID)
 
 	captureCtx, cancel := context.WithCancel(ctx)
-
-	fps := cfg.FPS
-	if fps <= 0 {
-		fps = 30
-	}
-
-	encoderParts := detectGstEncoder(cfg)
 
 	vapostprocOK := vapostprocAvailable()
 	if !vapostprocOK {
@@ -180,18 +189,27 @@ func vapostprocAvailable() bool {
 //     isn't registered at all and gst-launch would fail outright.
 //   - format=I420 forces 4:2:0 — RGB screens otherwise make x264enc emit
 //     "High 4:4:4 Predictive", which most receiver decoders reject (black).
+//   - pipewiresrc keepalive-time periodically emits the most recent buffer.
+//     Wayland compositors may otherwise stop producing buffers when a monitor
+//     has no pointer or visual damage, which makes receiver playback appear to
+//     pause until the pointer moves over that monitor.
 //   - videorate re-stamps buffers onto a regular fps timeline: the portal can
-//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true never
-//     duplicates frames during idle periods (no wasted bandwidth on a static
-//     screen); skip-to-first avoids buffering before the first frame.
+//     deliver pts=0, which confuses encoder/muxer timing. drop-only=true avoids
+//     introducing additional duplicates; skip-to-first avoids buffering before
+//     the first frame.
 //
 // The stream is encoded at the portal's native resolution; we do not rescale
 // because the captured surface size is whatever the compositor hands us. The
 // actual encoded dimensions are read back from the H.264 SPS downstream.
 func buildWaylandGstArgs(pwFdNum int, nodeID uint32, fps int, encoderParts encoderResult, vapostprocOK bool) []string {
 	gstArgs := []string{
-		"--quiet",
-		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
+		"pipewiresrc",
+		fmt.Sprintf("fd=%d", pwFdNum),
+		fmt.Sprintf("path=%d", nodeID),
+		"do-timestamp=true",
+		"automatic-eos=false",
+		"on-disconnect=error",
+		fmt.Sprintf("keepalive-time=%d", max(1, 1000/fps)),
 	}
 	if vapostprocOK {
 		gstArgs = append(gstArgs, "!", "vapostproc")
@@ -220,6 +238,9 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	if err := exec.Command("gst-inspect-1.0", "ximagesrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'ximagesrc' plugin not found; install gst-plugins-good")
 	}
+	if err := requireGstElement("h264parse", "gstreamer1.0-plugins-bad"); err != nil {
+		return nil, err
+	}
 
 	captureCtx, cancel := context.WithCancel(ctx)
 
@@ -231,6 +252,10 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 	display := os.Getenv("DISPLAY")
 
 	encoder := detectGstEncoder(cfg)
+	if encoder.err != nil {
+		cancel()
+		return nil, encoder.err
+	}
 
 	// Determine which region of the X screen to capture. ximagesrc captures
 	// the full X screen (all monitors combined) by default, so we crop to a
@@ -692,11 +717,12 @@ func parseXrandrGeometry(line string) (xOffset, yOffset, width, height int, ok b
 type encoderResult struct {
 	parts       []string
 	needsVulkan bool // encoder needs vulkanupload ! before it
+	err         error
 }
 
 // detectGstEncoder probes for available GStreamer H.264 encoders and returns
 // the encoder element + properties as gst-launch-1.0 arguments.
-// Priority: vulkanh264enc (NVENC via Vulkan) > nvh264enc > vah264enc > x264enc.
+// Priority: explicitly requested hardware encoder > x264enc.
 func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	fps := cfg.FPS
 	if fps <= 0 {
@@ -706,25 +732,13 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	keyframeInterval := keyframeIntervalFrames(fps)
 	hwaccel := cfg.HWAccel
 
-	// Try Vulkan H.264 (NVENC via Vulkan API) — lowest latency, no CPU usage
-	if hwaccel == "auto" || hwaccel == "nvenc" {
-		if exec.Command("gst-inspect-1.0", "vulkanh264enc").Run() == nil {
-			log.Printf("[CAPTURE] using NVENC hardware encoding (vulkanh264enc)")
-			return encoderResult{
-				parts: []string{
-					"vulkanh264enc",
-					"b-frames=0",
-					fmt.Sprintf("idr-period=%d", keyframeInterval),
-					"rate-control=cbr",
-					fmt.Sprintf("bitrate=%d", bitrate),
-				},
-				needsVulkan: true,
-			}
-		}
-	}
+	// Hardware encoders can be present while still failing caps negotiation with
+	// this PipeWire/videoconvert pipeline. In "auto", prefer the reliable
+	// software encoder until we have a full pipeline probe instead of just
+	// gst-inspect availability.
 
 	// Try legacy NVENC
-	if hwaccel == "auto" || hwaccel == "nvenc" {
+	if hwaccel == "nvenc" {
 		if exec.Command("gst-inspect-1.0", "nvh264enc").Run() == nil {
 			log.Printf("[CAPTURE] using NVENC hardware encoding (nvh264enc)")
 			return encoderResult{parts: []string{
@@ -743,7 +757,7 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	}
 
 	// Try VAAPI
-	if hwaccel == "auto" || hwaccel == "vaapi" {
+	if hwaccel == "vaapi" {
 		if exec.Command("gst-inspect-1.0", "vah264enc").Run() == nil {
 			log.Printf("[CAPTURE] using VAAPI hardware encoding (vah264enc)")
 			return encoderResult{parts: []string{
@@ -760,6 +774,9 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	}
 
 	// Software fallback: x264enc
+	if exec.Command("gst-inspect-1.0", "x264enc").Run() != nil {
+		return encoderResult{err: missingH264EncoderError()}
+	}
 	log.Printf("[CAPTURE] using software encoding (x264enc)")
 	vbvBuf := vbvBufferKbit(bitrate, fps)
 	// Use VBR (pass=0) so the encoder can undershoot on simple scenes, saving
@@ -781,6 +798,17 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 	}}
 }
 
+func missingH264EncoderError() error {
+	return fmt.Errorf("no GStreamer H.264 encoder found; install gstreamer1.0-plugins-ugly for x264enc or install a hardware H.264 encoder plugin")
+}
+
+func requireGstElement(element, pkg string) error {
+	if exec.Command("gst-inspect-1.0", element).Run() == nil {
+		return nil
+	}
+	return fmt.Errorf("GStreamer element %q not found; install %s", element, pkg)
+}
+
 // StartTestCapture creates a synthetic H.264 video stream using GStreamer's
 // videotestsrc + x264enc, producing High profile Annex-B byte stream output.
 // This replicates the same GStreamer pipeline ecosystem that UxPlay uses on the
@@ -795,6 +823,14 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 
 	bitrate := captureBitrateKbps(cfg)
 	keyframeInterval := keyframeIntervalFrames(fps)
+	if exec.Command("gst-inspect-1.0", "x264enc").Run() != nil {
+		cancel()
+		return nil, missingH264EncoderError()
+	}
+	if err := requireGstElement("h264parse", "gstreamer1.0-plugins-bad"); err != nil {
+		cancel()
+		return nil, err
+	}
 
 	// GStreamer pipeline: videotestsrc → timeoverlay → x264enc High profile → Annex-B byte stream → stdout
 	// pattern=18 = ball (bouncing ball with motion); timeoverlay adds a frame counter.
@@ -860,10 +896,10 @@ func logStderr(prefix string, r io.Reader) {
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 	for scanner.Scan() {
-		dbg("[%s] %s", prefix, scanner.Text())
+		log.Printf("[%s] %s", prefix, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		dbg("[%s] stderr read error: %v", prefix, err)
+		log.Printf("[%s] stderr read error: %v", prefix, err)
 	}
 }
 

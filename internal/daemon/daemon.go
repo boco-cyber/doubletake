@@ -88,6 +88,7 @@ type Config struct {
 	CredBackend     string
 	FPS             int
 	Bitrate         int
+	TargetLatencyMS int
 	HWAccel         string
 	ScreenID        string
 	VirtualPosition string
@@ -96,6 +97,9 @@ type Config struct {
 	NoEncrypt       bool
 	DirectKey       bool
 	NoAudio         bool
+	PortMin         int
+	PortMax         int
+	ForcePair       bool
 }
 
 // DefaultSocketPath returns the default socket path using XDG_RUNTIME_DIR.
@@ -133,6 +137,7 @@ type Daemon struct {
 	broadcast     *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
 	capture       *airplay.ScreenCapture    // underlying screen capture
 	captureCancel context.CancelFunc        // cancellation for shared capture context
+	lastError     string
 
 	// PIN-waiting state (at most one device waits for a PIN at a time)
 	pendingTarget string
@@ -175,6 +180,9 @@ func New(cfg Config) (*Daemon, error) {
 // Run starts the daemon control socket and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
 	airplay.DebugMode = d.cfg.Debug
+	if d.cfg.TargetLatencyMS > 0 {
+		airplay.SetTargetLatency(time.Duration(d.cfg.TargetLatencyMS) * time.Millisecond)
+	}
 
 	// Clean up stale socket
 	if err := os.Remove(d.cfg.SocketPath); err != nil && !os.IsNotExist(err) {
@@ -402,7 +410,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 		HasAudio:   hasAudio,
 		AudioMuted: audioMuted,
 		NeedsPIN:   overall == StatePINRequired,
-		Error:      errMsg,
+		Error:      firstNonEmpty(errMsg, d.lastError),
 		Streams:    streams,
 	}
 }
@@ -436,14 +444,33 @@ func screenIDForDisplay(id string) string {
 	return id
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (d *Daemon) handleScreens() Response {
 	d.mu.Lock()
 	current := screenIDForDisplay(d.cfg.ScreenID)
 	overall := d.overallStateLocked()
 	d.mu.Unlock()
 
-	var screens []ScreenInfo
-	if os.Getenv("WAYLAND_DISPLAY") == "" && os.Getenv("DISPLAY") != "" {
+	screens := []ScreenInfo{{Name: "auto", Available: true}}
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		screens = append(screens, ScreenInfo{
+			Name:      "virtual",
+			Width:     1920,
+			Height:    1080,
+			IsVirtual: true,
+			// The screencast portal can select existing sources but cannot ask
+			// GNOME/Mutter to add an extended-desktop output.
+			Available: false,
+		})
+	} else if os.Getenv("DISPLAY") != "" {
 		monitors, err := airplay.ListX11Monitors(os.Getenv("DISPLAY"))
 		if err != nil {
 			return Response{OK: false, State: overall, Error: fmt.Sprintf("list screens: %v", err)}
@@ -479,6 +506,13 @@ func (d *Daemon) handleScreenSet(req Request) Response {
 	if screen == "auto" {
 		screen = ""
 	}
+	if screen == "virtual" && os.Getenv("WAYLAND_DISPLAY") != "" {
+		return Response{
+			OK:    false,
+			State: d.overallStateLocked(),
+			Error: "an extended virtual display is not supported by the GNOME Wayland screencast portal; select Auto / Portal Picker to mirror an existing screen",
+		}
+	}
 	d.cfg.ScreenID = screen
 
 	return Response{OK: true, State: d.overallStateLocked(), CurrentScreen: screenIDForDisplay(d.cfg.ScreenID)}
@@ -486,6 +520,7 @@ func (d *Daemon) handleScreenSet(req Request) Response {
 
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
+	d.lastError = ""
 
 	// If we're waiting for a PIN and one was provided, resume that pending stream.
 	if d.pendingTarget != "" && req.Pin != "" {
@@ -587,6 +622,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	removeStream := func(msg string) {
 		if msg != "" {
 			log.Printf("[daemon] %s", msg)
+			d.mu.Lock()
+			d.lastError = msg
+			d.mu.Unlock()
 		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -607,7 +645,10 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	}
 
 	deviceID := info.DeviceID
-	savedCreds := d.credStore.Lookup(deviceID)
+	var savedCreds *airplay.SavedCredentials
+	if !d.cfg.ForcePair {
+		savedCreds = d.credStore.Lookup(deviceID)
+	}
 	screenCastRestoreToken := ""
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
@@ -623,6 +664,20 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 
 	// Pairing
 	paired := false
+	if d.cfg.ForcePair && pin == "" {
+		if err := client.StartPINDisplay(); err != nil {
+			log.Printf("[daemon] start PIN display failed: %v", err)
+		}
+		client.Close()
+		d.mu.Lock()
+		delete(d.streams, target)
+		d.pendingTarget = target
+		d.pendingPort = port
+		d.mu.Unlock()
+		log.Printf("[daemon] PIN required for forced pairing with %s", info.Name)
+		return
+	}
+
 	if pin != "" {
 		if err := client.Pair(ctx, pin); err != nil {
 			client.Close()
@@ -710,6 +765,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 		NoEncrypt: d.cfg.NoEncrypt,
 		DirectKey: d.cfg.DirectKey,
 		NoAudio:   d.cfg.NoAudio,
+		PortMin:   d.cfg.PortMin,
+		PortMax:   d.cfg.PortMax,
 	}
 	session, err := client.SetupMirror(ctx, streamCfg)
 	if err != nil {
@@ -768,6 +825,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	streamErr := session.StreamFrames(ctx, sink.AsCapture(), 0)
 	if streamErr != nil && ctx.Err() == nil {
 		log.Printf("[daemon] stream error for %s: %v", target, streamErr)
+		d.mu.Lock()
+		d.lastError = fmt.Sprintf("stream error for %s: %v", target, streamErr)
+		d.mu.Unlock()
 	}
 
 	// Cleanup this stream.
@@ -846,8 +906,11 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 	d.mu.Unlock()
 
 	go func() {
-		if runErr := newBC.Run(); runErr != nil && runErr.Error() != "EOF" {
-			log.Printf("[daemon] broadcast capture error: %v", runErr)
+		if runErr := newBC.Run(); runErr != nil {
+			log.Printf("[daemon] broadcast capture ended: %v", runErr)
+			d.mu.Lock()
+			d.lastError = fmt.Sprintf("capture ended: %v", runErr)
+			d.mu.Unlock()
 		}
 		// When the capture ends, stop all active streams.
 		d.mu.Lock()

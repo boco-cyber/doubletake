@@ -1,0 +1,6 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: #090d11; color: white; font-family: sans-serif; }
+header { height: 56px; display: flex; align-items: center; justify-content: space-around; font-weight: 700; }
+main { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 0 8px 8px; }
+figure { margin: 0; min-width: 0; }
+img { display: block; width: 100%; height: auto; border: 1px solid #39434c; }

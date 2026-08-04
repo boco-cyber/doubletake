@@ -1,0 +1,10 @@
+#!/bin/sh
+
+export PATH="@PREFIX@/bin:$PATH"
+export GST_PLUGIN_PATH="@PREFIX@/lib/doubletake/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+
+if command -v curl >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8199/api/snapshot >/dev/null 2>&1; then
+  exec "@PREFIX@/bin/doubletake" -open-shell-window
+fi
+
+exec "@PREFIX@/bin/doubletake" -shell "$@"

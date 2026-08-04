@@ -91,6 +91,12 @@ func TestBuildWaylandGstArgsSkipsMissingVapostproc(t *testing.T) {
 	if convertIndex < 0 || i420Index < 0 || convertIndex >= i420Index {
 		t.Fatalf("expected videoconvert before I420 caps for PipeWire format negotiation: %s", strings.Join(withoutVapostproc, " "))
 	}
+	if !containsArg(withoutVapostproc, "keepalive-time=33") {
+		t.Fatalf("expected PipeWire keepalive at 30 fps so idle screens continue streaming: %s", strings.Join(withoutVapostproc, " "))
+	}
+	if containsArg(withoutVapostproc, "resend-last=true") {
+		t.Fatalf("resend-last only applies to EOS and must not be used as an idle keepalive: %s", strings.Join(withoutVapostproc, " "))
+	}
 }
 
 func containsArg(args []string, want string) bool {
@@ -332,7 +338,7 @@ func TestWaylandRequestToken(t *testing.T) {
 		cfg  CaptureConfig
 		want string
 	}{
-		{"no screen override reuses saved token", CaptureConfig{RestoreToken: "saved-token"}, "saved-token"},
+		{"saved token still forces fresh picker", CaptureConfig{RestoreToken: "saved-token"}, ""},
 		{"named screen forces fresh picker", CaptureConfig{RestoreToken: "saved-token", ScreenID: "DP-3"}, ""},
 		{"virtual screen forces fresh picker", CaptureConfig{RestoreToken: "saved-token", ScreenID: "virtual"}, ""},
 		{"no saved token, no override", CaptureConfig{}, ""},

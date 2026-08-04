@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +22,7 @@ import (
 
 	"doubletake/internal/airplay"
 	"doubletake/internal/daemon"
+	"doubletake/internal/shell"
 )
 
 // parsePortRange parses a "min-max" string into inclusive port bounds.
@@ -69,7 +75,39 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with Unix socket control interface")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Unix socket path for daemon control interface")
+	shellMode := flag.Bool("shell", false, "Start the daemon and open the browser control shell")
+	shellListen := flag.String("shell-listen", "127.0.0.1:8199", "HTTP address for the browser control shell")
+	shellUIDir := flag.String("shell-ui-dir", "", "Directory containing the built browser shell (auto-detect when empty)")
+	shellOpen := flag.Bool("shell-open", true, "Open the browser control shell on startup")
+	openShellWindow := flag.Bool("open-shell-window", false, "Open the running browser control shell as an app window")
+	installApp := flag.Bool("install", false, "Install Doubletake into the user application menu")
+	installPrefix := flag.String("install-prefix", "", "Installation prefix for -install (default: ~/.local)")
 	flag.Parse()
+
+	if *openShellWindow {
+		if err := shell.OpenAppWindow("http://" + *shellListen); err != nil {
+			log.Fatalf("open shell window failed: %v", err)
+		}
+		return
+	}
+
+	if *installApp {
+		if err := selfInstall(*installPrefix); err != nil {
+			log.Fatalf("install failed: %v", err)
+		}
+		return
+	}
+
+	flagsSet := visitedFlags()
+	var savedShellSettings *uiSettings
+	if *shellMode {
+		if value, err := loadUISettings(); err == nil {
+			savedShellSettings = value
+			applyUISettings(value, flagsSet, screen, virtualPosition, fps, bitrate, targetLatencyMs, hwaccel, noAudio, socketPath, credFile, credBackend, forcePair, debug, testMode, noEncrypt, directKey)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("[shell] saved settings ignored: %v", err)
+		}
+	}
 
 	switch *virtualPosition {
 	case "left", "right", "above", "below":
@@ -82,12 +120,47 @@ func main() {
 		return
 	}
 
+	portMin, portMax, err := parsePortRange(*portRange)
+	if err != nil {
+		log.Fatalf("invalid -port-range: %v", err)
+	}
+	if *shellMode && savedShellSettings != nil && !flagsSet["port-range"] {
+		portMin = savedShellSettings.PortMin
+		portMax = savedShellSettings.PortMax
+	}
+
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.DebugMode = *debug
 
+	if *shellMode {
+		runShellApp(shellRunConfig{
+			socketPath:      *socketPath,
+			credFile:        *credFile,
+			credBackend:     *credBackend,
+			fps:             *fps,
+			bitrate:         *bitrate,
+			targetLatencyMS: *targetLatencyMs,
+			hwaccel:         *hwaccel,
+			screen:          *screen,
+			virtualPosition: *virtualPosition,
+			debug:           *debug,
+			testMode:        *testMode,
+			noEncrypt:       *noEncrypt,
+			directKey:       *directKey,
+			noAudio:         *noAudio,
+			portMin:         portMin,
+			portMax:         portMax,
+			forcePair:       *forcePair,
+			listen:          *shellListen,
+			uiDir:           *shellUIDir,
+			openBrowser:     *shellOpen,
+		})
+		return
+	}
+
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *screen, *virtualPosition, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *targetLatencyMs, *hwaccel, *screen, *virtualPosition, *debug, *testMode, *noEncrypt, *directKey, *noAudio, portMin, portMax, *forcePair)
 		return
 	}
 
@@ -256,10 +329,6 @@ func main() {
 		}
 	}
 
-	portMin, portMax, err := parsePortRange(*portRange)
-	if err != nil {
-		log.Fatalf("invalid -port-range: %v", err)
-	}
 	streamCfg := airplay.StreamConfig{
 		FPS:       *fps,
 		Bitrate:   *bitrate,
@@ -447,13 +516,508 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel, screen, virtualPosition string, debug, testMode, noEncrypt, directKey, noAudio bool) {
+type shellRunConfig struct {
+	socketPath      string
+	credFile        string
+	credBackend     string
+	fps             int
+	bitrate         int
+	targetLatencyMS int
+	hwaccel         string
+	screen          string
+	virtualPosition string
+	debug           bool
+	testMode        bool
+	noEncrypt       bool
+	directKey       bool
+	noAudio         bool
+	portMin         int
+	portMax         int
+	forcePair       bool
+	listen          string
+	uiDir           string
+	openBrowser     bool
+}
+
+type uiSettings struct {
+	Screen          string `json:"screen"`
+	VirtualPosition string `json:"virtualPosition"`
+	FPS             int    `json:"fps"`
+	Bitrate         int    `json:"bitrate"`
+	TargetLatencyMS int    `json:"targetLatencyMs"`
+	HWAccel         string `json:"hwaccel"`
+	NoAudio         bool   `json:"noAudio"`
+	PortMin         int    `json:"portMin"`
+	PortMax         int    `json:"portMax"`
+	SocketPath      string `json:"socketPath"`
+	CredBackend     string `json:"credBackend"`
+	CredFile        string `json:"credFile"`
+	ForcePair       bool   `json:"forcePair"`
+	Debug           bool   `json:"debug"`
+	TestMode        bool   `json:"testMode"`
+	NoEncrypt       bool   `json:"noEncrypt"`
+	DirectKey       bool   `json:"directKey"`
+}
+
+func visitedFlags() map[string]bool {
+	seen := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
+	})
+	return seen
+}
+
+func loadUISettings() (*uiSettings, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(configDir, "doubletake", "ui-settings.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var value uiSettings
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	return &value, nil
+}
+
+func applyUISettings(value *uiSettings, flagsSet map[string]bool, screen, virtualPosition *string, fps, bitrate, targetLatencyMS *int, hwaccel *string, noAudio *bool, socketPath, credFile, credBackend *string, forcePair, debug, testMode, noEncrypt, directKey *bool) {
+	if !flagsSet["screen"] {
+		*screen = value.Screen
+		if *screen == "auto" {
+			*screen = ""
+		}
+	}
+	if value.VirtualPosition != "" && !flagsSet["virtual-position"] {
+		*virtualPosition = value.VirtualPosition
+	}
+	if value.FPS > 0 && !flagsSet["fps"] {
+		*fps = value.FPS
+	}
+	if !flagsSet["bitrate"] {
+		*bitrate = value.Bitrate
+	}
+	if value.TargetLatencyMS > 0 && !flagsSet["target-latency-ms"] {
+		*targetLatencyMS = value.TargetLatencyMS
+	}
+	if value.HWAccel != "" && !flagsSet["hwaccel"] {
+		*hwaccel = value.HWAccel
+	}
+	if !flagsSet["no-audio"] {
+		*noAudio = value.NoAudio
+	}
+	if value.SocketPath != "" && !flagsSet["socket"] {
+		*socketPath = value.SocketPath
+	}
+	if value.CredFile != "" && !flagsSet["creds"] {
+		*credFile = value.CredFile
+	}
+	if value.CredBackend != "" && !flagsSet["cred-backend"] {
+		*credBackend = value.CredBackend
+	}
+	if !flagsSet["pair"] {
+		*forcePair = value.ForcePair
+	}
+	if !flagsSet["debug"] {
+		*debug = value.Debug
+	}
+	if !flagsSet["test"] {
+		*testMode = value.TestMode
+	}
+	if !flagsSet["no-encrypt"] {
+		*noEncrypt = value.NoEncrypt
+	}
+	if !flagsSet["direct-key"] {
+		*directKey = value.DirectKey
+	}
+}
+
+func selfInstall(prefix string) error {
+	if prefix == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		prefix = filepath.Join(home, ".local")
+	}
+	prefix, err := filepath.Abs(prefix)
+	if err != nil {
+		return err
+	}
+	if prefix == "/" {
+		return fmt.Errorf("refusing to install to /")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return err
+	}
+
+	binDir := filepath.Join(prefix, "bin")
+	shareDir := filepath.Join(prefix, "share")
+	manDir := filepath.Join(shareDir, "man", "man1")
+	appDir := filepath.Join(shareDir, "applications")
+	iconDir := filepath.Join(shareDir, "icons", "hicolor", "scalable", "apps")
+	uiTargetDir := filepath.Join(shareDir, "doubletake", "ui")
+
+	for _, dir := range []string{binDir, manDir, appDir, iconDir, uiTargetDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+
+	if err := copyFileIfDifferent(exe, filepath.Join(binDir, "doubletake"), 0o755); err != nil {
+		return err
+	}
+	log.Printf("installed %s", filepath.Join(binDir, "doubletake"))
+
+	launcherPath := filepath.Join(binDir, "doubletake-launch")
+	if err := os.WriteFile(launcherPath, []byte(launchScript(prefix)), 0o755); err != nil {
+		return err
+	}
+	log.Printf("installed %s", launcherPath)
+
+	iconPath := filepath.Join(iconDir, "doubletake.svg")
+	if err := os.WriteFile(iconPath, []byte(appIconSVG()), 0o644); err != nil {
+		return err
+	}
+	log.Printf("installed icon to %s", iconPath)
+
+	installOptionalBinary("doubletake-ctl", exe, binDir)
+	installOptionalBinary("doubletake-ui", exe, binDir)
+
+	uiSourceDir, err := shell.ResolveStaticDir("")
+	if err != nil {
+		return fmt.Errorf("locate shell UI assets: %w", err)
+	}
+	if err := copyDir(uiSourceDir, uiTargetDir); err != nil {
+		return err
+	}
+	log.Printf("installed shell UI assets to %s", uiTargetDir)
+
+	installOptionalFile(filepath.Join("man", "man1", "doubletake.1"), filepath.Join(manDir, "doubletake.1"), 0o644)
+	installOptionalFile(filepath.Join("man", "man1", "doubletake-ctl.1"), filepath.Join(manDir, "doubletake-ctl.1"), 0o644)
+
+	desktopPath := filepath.Join(appDir, "doubletake.desktop")
+	if err := os.WriteFile(desktopPath, []byte(desktopEntry(prefix)), 0o644); err != nil {
+		return err
+	}
+	log.Printf("installed desktop launcher to %s", desktopPath)
+	_ = os.Remove(filepath.Join(appDir, "doubletake-shell.desktop"))
+	refreshDesktopIcon(prefix)
+
+	log.Printf("Doubletake is installed. Launch it from your app menu or run: %s -shell", filepath.Join(binDir, "doubletake"))
+	return nil
+}
+
+func installOptionalBinary(name, currentExe, binDir string) {
+	if src, ok := findCompanionBinary(name, currentExe); ok {
+		dst := filepath.Join(binDir, name)
+		if err := copyFileIfDifferent(src, dst, 0o755); err != nil {
+			log.Printf("warning: could not install %s: %v", name, err)
+			return
+		}
+		log.Printf("installed %s", dst)
+		return
+	}
+	log.Printf("warning: %s not found next to the current binary or in ./bin; skipping", name)
+}
+
+func findCompanionBinary(name, currentExe string) (string, bool) {
+	for _, candidate := range []string{
+		filepath.Join(filepath.Dir(currentExe), name),
+		filepath.Join("bin", name),
+		name,
+	} {
+		path, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if path == currentExe {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+func installOptionalFile(src, dst string, mode fs.FileMode) {
+	if err := copyFileIfDifferent(src, dst, mode); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			log.Printf("warning: %s not found; skipping", src)
+			return
+		}
+		log.Printf("warning: could not install %s: %v", src, err)
+		return
+	}
+	log.Printf("installed %s", dst)
+}
+
+func copyFileIfDifferent(src, dst string, mode fs.FileMode) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if srcInfo.IsDir() {
+		return fmt.Errorf("%s is a directory", src)
+	}
+	srcAbs, _ := filepath.Abs(src)
+	dstAbs, _ := filepath.Abs(dst)
+	if srcAbs == dstAbs {
+		return os.Chmod(dst, mode)
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
+func copyDir(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if info.Mode().Type() != 0 {
+			continue
+		}
+		if err := copyFileIfDifferent(srcPath, dstPath, info.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func desktopEntry(prefix string) string {
+	execPath := filepath.Join(prefix, "bin", "doubletake-launch")
+	return fmt.Sprintf(`[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Doubletake
+GenericName=AirPlay Screen Mirroring
+Comment=Control AirPlay mirroring from the Doubletake shell
+Exec=%s
+TryExec=%s
+Icon=doubletake
+Terminal=false
+StartupWMClass=Doubletake
+Categories=AudioVideo;
+Keywords=AirPlay;Apple TV;Screen;Mirror;Cast;
+StartupNotify=true
+`, execPath, execPath)
+}
+
+func appIconSVG() string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="14" x2="108" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#32b4ff"/>
+      <stop offset="1" stop-color="#1268f3"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="26" y1="22" x2="102" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".52"/>
+      <stop offset=".55" stop-color="#ffffff" stop-opacity=".08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#052451" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect x="14" y="14" width="100" height="100" rx="24" fill="url(#bg)" filter="url(#shadow)"/>
+  <path d="M34 40h60a8 8 0 0 1 8 8v36a8 8 0 0 1-8 8H34a8 8 0 0 1-8-8V48a8 8 0 0 1 8-8Z" fill="#0b1d36" opacity=".34"/>
+  <path d="M35 34h58a9 9 0 0 1 9 9v34a9 9 0 0 1-9 9H35a9 9 0 0 1-9-9V43a9 9 0 0 1 9-9Z" fill="#eff9ff"/>
+  <path d="M38 44h52a3 3 0 0 1 3 3v25a3 3 0 0 1-3 3H38a3 3 0 0 1-3-3V47a3 3 0 0 1 3-3Z" fill="#12325c"/>
+  <path d="M48 101h32" stroke="#eff9ff" stroke-width="8" stroke-linecap="round"/>
+  <path d="M64 86v15" stroke="#eff9ff" stroke-width="8" stroke-linecap="round"/>
+  <path d="M64 58 45 79h38L64 58Z" fill="#31d7ff"/>
+  <path d="M14 14h100v48c-23-18-50-25-100-12V38c0-13 11-24 24-24Z" fill="url(#shine)"/>
+</svg>
+`
+}
+
+func refreshDesktopIcon(prefix string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	for _, desktopDir := range []string{
+		filepath.Join(home, "Desktop"),
+		filepath.Join(home, "Рабочий стол"),
+	} {
+		info, err := os.Stat(desktopDir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		desktopPath := filepath.Join(desktopDir, "doubletake.desktop")
+		if _, err := os.Stat(desktopPath); err != nil {
+			continue
+		}
+		if err := os.WriteFile(desktopPath, []byte(desktopEntry(prefix)), 0o755); err != nil {
+			log.Printf("warning: could not refresh desktop icon %s: %v", desktopPath, err)
+			continue
+		}
+		_ = exec.Command("gio", "set", desktopPath, "metadata::trusted", "true").Run()
+		log.Printf("refreshed desktop icon %s", desktopPath)
+	}
+}
+
+func launchScript(prefix string) string {
+	return fmt.Sprintf(`#!/bin/sh
+
+export PATH="%s/bin:$PATH"
+export GST_PLUGIN_PATH="%s/lib/doubletake/gstreamer-1.0${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+
+URL="http://127.0.0.1:8199/api/snapshot"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/doubletake"
+LOG_FILE="$LOG_DIR/launcher.log"
+
+mkdir -p "$LOG_DIR"
+
+if ! command -v curl >/dev/null 2>&1 || ! curl -fsS "$URL" >/dev/null 2>&1; then
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "%s/bin/doubletake" -shell -shell-open=false "$@" >>"$LOG_FILE" 2>&1 </dev/null
+  else
+    nohup "%s/bin/doubletake" -shell -shell-open=false "$@" >>"$LOG_FILE" 2>&1 </dev/null &
+  fi
+  i=0
+  while [ "$i" -lt 80 ]; do
+    if command -v curl >/dev/null 2>&1 && curl -fsS "$URL" >/dev/null 2>&1; then
+      break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+fi
+
+exec "%s/bin/doubletake" -open-shell-window
+`, prefix, prefix, prefix, prefix, prefix)
+}
+
+func runShellApp(cfg shellRunConfig) {
+	dcfg := daemon.Config{
+		SocketPath:      cfg.socketPath,
+		CredFile:        cfg.credFile,
+		CredBackend:     cfg.credBackend,
+		FPS:             cfg.fps,
+		Bitrate:         cfg.bitrate,
+		TargetLatencyMS: cfg.targetLatencyMS,
+		HWAccel:         cfg.hwaccel,
+		ScreenID:        cfg.screen,
+		VirtualPosition: cfg.virtualPosition,
+		Debug:           cfg.debug,
+		TestMode:        cfg.testMode,
+		NoEncrypt:       cfg.noEncrypt,
+		DirectKey:       cfg.directKey,
+		NoAudio:         cfg.noAudio,
+		PortMin:         cfg.portMin,
+		PortMax:         cfg.portMax,
+		ForcePair:       cfg.forcePair,
+	}
+
+	d, err := daemon.New(dcfg)
+	if err != nil {
+		log.Fatalf("[daemon] %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	daemonErr := make(chan error, 1)
+	go func() {
+		daemonErr <- d.Run(ctx)
+	}()
+	defer d.Shutdown()
+
+	if err := waitForSocket(ctx, cfg.socketPath, daemonErr); err != nil {
+		log.Fatalf("[shell] daemon startup failed: %v", err)
+	}
+
+	if err := shell.Run(ctx, shell.Options{
+		Listen:      cfg.listen,
+		SocketPath:  cfg.socketPath,
+		StaticDir:   cfg.uiDir,
+		OpenBrowser: cfg.openBrowser,
+	}); err != nil && ctx.Err() == nil {
+		log.Fatalf("[shell] %v", err)
+	}
+}
+
+func waitForSocket(ctx context.Context, socketPath string, daemonErr <-chan error) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		if _, err := os.Stat(socketPath); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-daemonErr:
+			if err == nil {
+				return fmt.Errorf("daemon exited before creating socket")
+			}
+			return err
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for %s", socketPath)
+		case <-ticker.C:
+		}
+	}
+}
+
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate, targetLatencyMS int, hwaccel, screen, virtualPosition string, debug, testMode, noEncrypt, directKey, noAudio bool, portMin, portMax int, forcePair bool) {
 	cfg := daemon.Config{
 		SocketPath:      socketPath,
 		CredFile:        credFile,
 		CredBackend:     credBackend,
 		FPS:             fps,
 		Bitrate:         bitrate,
+		TargetLatencyMS: targetLatencyMS,
 		HWAccel:         hwaccel,
 		ScreenID:        screen,
 		VirtualPosition: virtualPosition,
@@ -462,6 +1026,9 @@ func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwacc
 		NoEncrypt:       noEncrypt,
 		DirectKey:       directKey,
 		NoAudio:         noAudio,
+		PortMin:         portMin,
+		PortMax:         portMax,
+		ForcePair:       forcePair,
 	}
 
 	d, err := daemon.New(cfg)

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Doubletake
+GenericName=AirPlay Screen Mirroring
+Comment=Control AirPlay mirroring from the Doubletake shell
+Exec=@PREFIX@/bin/doubletake-launch
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Network;
+Keywords=AirPlay;Apple TV;Screen;Mirror;Cast;
+StartupNotify=true

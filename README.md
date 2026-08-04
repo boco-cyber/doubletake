@@ -48,12 +48,25 @@ You can also install from the AUR:
 make
 ```
 
-This builds both binaries into `bin/`:
+This builds the binaries into `bin/`:
 
 - `bin/doubletake`
 - `bin/doubletake-ctl`
+- `bin/doubletake-ui`
 
 ## Install
+
+Self-install into your user app menu and `~/.local`:
+
+```sh
+./bin/doubletake -install
+```
+
+Use a custom prefix if needed:
+
+```sh
+./bin/doubletake -install -install-prefix /opt/doubletake
+```
 
 Install binaries and man pages (default prefix: `/usr/local`):
 
@@ -106,6 +119,9 @@ the Apple TV's address on the chosen range.
 ## Usage
 
 ```sh
+# Start the control shell app (daemon + browser UI)
+doubletake -shell
+
 # Discover Apple TVs on the network and stream
 doubletake
 
@@ -146,6 +162,18 @@ doubletake-ctl disconnect 192.168.1.77
 doubletake-ctl disconnect
 ```
 
+### Browser Shell
+
+The shell starts a local daemon, serves the control UI, and opens it at
+`http://127.0.0.1:8199`:
+
+```sh
+doubletake -shell
+```
+
+Settings saved in the shell are loaded the next time `doubletake -shell` starts.
+Explicit command-line flags still override saved shell settings for that run.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -167,6 +195,12 @@ doubletake-ctl disconnect
 | `-no-audio` | false | Disable audio streaming |
 | `-test` | false | Use synthetic video source |
 | `-daemonize` | false | Run as background daemon with Unix socket control interface |
+| `-shell` | false | Start the daemon and open the browser control shell |
+| `-shell-listen` | `127.0.0.1:8199` | HTTP address for the browser control shell |
+| `-shell-open` | true | Open the browser control shell on startup |
+| `-shell-ui-dir` | auto | Directory containing the built browser shell |
+| `-install` | false | Install Doubletake into the user application menu |
+| `-install-prefix` | `~/.local` | Installation prefix for `-install` |
 | `-socket` | `$XDG_RUNTIME_DIR/doubletake.sock` | Daemon control socket path |
 | `-debug` | false | Verbose debug logging |
 

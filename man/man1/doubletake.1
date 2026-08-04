@@ -25,6 +25,8 @@ mDNS device discovery
 .IP \(bu 2
 Daemon mode with multi-target streaming control via
 .B doubletake-ctl
+.IP \(bu 2
+Browser shell for local app-style control
 .SH OPTIONS
 .TP
 .B \-target \fIIP\fR
@@ -72,7 +74,33 @@ Enable verbose protocol logging
 .B \-daemonize
 Run in daemon mode for multi-target control via
 .B doubletake-ctl
+.TP
+.B \-shell
+Start the daemon and open the browser control shell
+.TP
+.B \-shell-listen \fIADDR\fR
+HTTP address for the browser control shell (default: 127.0.0.1:8199)
+.TP
+.B \-shell-open
+Open the browser control shell on startup (default: true)
+.TP
+.B \-shell-ui-dir \fIPATH\fR
+Directory containing the built browser shell (auto-detects when empty)
+.TP
+.B \-install
+Install Doubletake into the user application menu
+.TP
+.B \-install-prefix \fIPREFIX\fR
+Installation prefix for
+.B \-install
+(default: ~/.local)
 .SH EXAMPLES
+.TP
+Install Doubletake into the user app menu:
+.B doubletake \-install
+.TP
+Start the control shell:
+.B doubletake \-shell
 .TP
 Discover and connect to any Apple TV on the network:
 .B doubletake
