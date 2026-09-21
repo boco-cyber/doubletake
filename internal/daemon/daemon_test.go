@@ -35,6 +35,7 @@ func TestHandleScreensNoDisplay(t *testing.T) {
 
 func TestHandleScreensWaylandShowsVirtual(t *testing.T) {
 	t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent-doubletake-test-bus")
 	t.Setenv("DISPLAY", "")
 
 	d := newTestDaemon(t)
@@ -120,6 +121,7 @@ func TestHandleScreenSetRejectedWhileStreaming(t *testing.T) {
 
 func TestHandleScreenSetRejectsVirtualOnWayland(t *testing.T) {
 	t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent-doubletake-test-bus")
 
 	d := newTestDaemon(t)
 	resp := d.handleScreenSet(Request{Cmd: "screen-set", Target: "virtual"})

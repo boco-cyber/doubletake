@@ -466,9 +466,7 @@ func (d *Daemon) handleScreens() Response {
 			Width:     1920,
 			Height:    1080,
 			IsVirtual: true,
-			// The screencast portal can select existing sources but cannot ask
-			// GNOME/Mutter to add an extended-desktop output.
-			Available: false,
+			Available: airplay.SupportsWaylandVirtualDisplay(),
 		})
 	} else if os.Getenv("DISPLAY") != "" {
 		monitors, err := airplay.ListX11Monitors(os.Getenv("DISPLAY"))
@@ -506,11 +504,11 @@ func (d *Daemon) handleScreenSet(req Request) Response {
 	if screen == "auto" {
 		screen = ""
 	}
-	if screen == "virtual" && os.Getenv("WAYLAND_DISPLAY") != "" {
+	if screen == "virtual" && os.Getenv("WAYLAND_DISPLAY") != "" && !airplay.SupportsWaylandVirtualDisplay() {
 		return Response{
 			OK:    false,
 			State: d.overallStateLocked(),
-			Error: "an extended virtual display is not supported by the GNOME Wayland screencast portal; select Auto / Portal Picker to mirror an existing screen",
+			Error: "this compositor does not expose the Mutter virtual display API; use GNOME Wayland for an extended display",
 		}
 	}
 	d.cfg.ScreenID = screen

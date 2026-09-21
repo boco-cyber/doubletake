@@ -1,8 +1,12 @@
 package airplay
 
 import (
+	"context"
+	"io"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRecommendedBitrateKbps(t *testing.T) {
@@ -71,12 +75,12 @@ func TestKeyframeIntervalFrames(t *testing.T) {
 func TestBuildWaylandGstArgsSkipsMissingVapostproc(t *testing.T) {
 	encoder := encoderResult{parts: []string{"x264enc"}}
 
-	withVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, true)
+	withVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, true, 0, 0)
 	if !containsArg(withVapostproc, "vapostproc") {
 		t.Fatalf("expected pipeline to include vapostproc when available: %s", strings.Join(withVapostproc, " "))
 	}
 
-	withoutVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, false)
+	withoutVapostproc := buildWaylandGstArgs(3, 99, 30, encoder, false, 0, 0)
 	if containsArg(withoutVapostproc, "vapostproc") {
 		t.Fatalf("expected pipeline to omit vapostproc when unavailable: %s", strings.Join(withoutVapostproc, " "))
 	}
@@ -96,6 +100,35 @@ func TestBuildWaylandGstArgsSkipsMissingVapostproc(t *testing.T) {
 	}
 	if containsArg(withoutVapostproc, "resend-last=true") {
 		t.Fatalf("resend-last only applies to EOS and must not be used as an idle keepalive: %s", strings.Join(withoutVapostproc, " "))
+	}
+}
+
+func TestBuildWaylandGstArgsPinsVirtualDisplaySize(t *testing.T) {
+	encoder := encoderResult{parts: []string{"x264enc"}}
+
+	args := buildWaylandGstArgs(-1, 77, 30, encoder, true, 1920, 1080)
+	if !containsArg(args, "video/x-raw,format=BGRx,width=1920,height=1080,framerate=0/1,max-framerate=30/1") {
+		t.Fatalf("expected virtual display to pin width/height/framerate caps for Mutter RecordVirtual size negotiation: %s", strings.Join(args, " "))
+	}
+	if containsArg(args, "fd=3") {
+		t.Fatalf("virtual display stream must not require a portal PipeWire fd: %s", strings.Join(args, " "))
+	}
+	if !containsArg(args, "path=77") {
+		t.Fatalf("expected pipeline to capture from the virtual stream node: %s", strings.Join(args, " "))
+	}
+}
+
+func TestBuildWaylandGstArgsLeavesPortalSizeUnconstrained(t *testing.T) {
+	encoder := encoderResult{parts: []string{"x264enc"}}
+
+	args := buildWaylandGstArgs(3, 99, 30, encoder, true, 0, 0)
+	for _, a := range args {
+		if strings.HasPrefix(a, "video/x-raw,width=") {
+			t.Fatalf("portal capture must not constrain width/height: %s", strings.Join(args, " "))
+		}
+	}
+	if !containsArg(args, "fd=3") {
+		t.Fatalf("portal capture must pass the portal PipeWire fd: %s", strings.Join(args, " "))
 	}
 }
 
@@ -350,4 +383,36 @@ func TestWaylandRequestToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestLiveMutterVirtualCapture is opt-in because it temporarily adds a desktop
+// monitor. It verifies real encoded frames keep arriving without pointer motion.
+func TestLiveMutterVirtualCapture(t *testing.T) {
+	if os.Getenv("DOUBLETAKE_TEST_VIRTUAL") != "1" {
+		t.Skip("requires a live GNOME session")
+	}
+	if !SupportsWaylandVirtualDisplay() {
+		t.Fatal("Mutter virtual display unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	capture, err := startWaylandCapture(ctx, CaptureConfig{ScreenID: "virtual", FPS: 30, HWAccel: "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer capture.Stop()
+	started := time.Now()
+	buf := make([]byte, 65536)
+	var total int
+	for time.Since(started) < 5*time.Second {
+		n, err := capture.stdout.Read(buf)
+		total += n
+		if err != nil {
+			t.Fatalf("capture stopped after %s (%d bytes): %v", time.Since(started), total, err)
+		}
+	}
+	if total == 0 {
+		t.Fatal(io.ErrUnexpectedEOF)
+	}
+	t.Logf("received %d encoded bytes over %s without pointer activity", total, time.Since(started))
 }

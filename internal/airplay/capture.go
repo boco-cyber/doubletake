@@ -25,8 +25,7 @@ type CaptureConfig struct {
 	// ScreenID selects what to capture: "" auto-detects the primary monitor
 	// (X11) or shows the portal's picker (Wayland); a name selects that
 	// connected X11 output; "virtual" requests a virtual extended-desktop
-	// monitor. On Wayland, "virtual" is routed through the desktop portal
-	// because the compositor owns virtual-output creation and selection.
+	// monitor. On GNOME Wayland, "virtual" uses Mutter RecordVirtual.
 	ScreenID string
 	// VirtualPosition places a "virtual" ScreenID relative to the primary
 	// monitor: "left", "right", "above", or "below". Defaults to "right".
@@ -90,10 +89,6 @@ func waylandRequestToken(cfg CaptureConfig) string {
 }
 
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	if cfg.ScreenID == "virtual" {
-		return nil, fmt.Errorf("Apple TV as an extended virtual display is not available on this GNOME Wayland session; the Wayland screencast portal can only mirror an existing screen/window. Use an Xorg session with a virtual/dummy output, or GNOME Remote Desktop's extend mode, then stream that created monitor.")
-	}
-
 	// Check dependencies
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
@@ -112,14 +107,27 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 		return nil, encoderParts.err
 	}
 
-	requestToken := waylandRequestToken(cfg)
-	nodeID, pwFd, dbusConn, restoreToken, err := requestScreencast(ctx, requestToken)
-	if err != nil {
-		return nil, fmt.Errorf("screencast portal: %w", err)
-	}
-	if restoreToken != "" && cfg.SaveRestoreToken != nil {
-		if err := cfg.SaveRestoreToken(restoreToken); err != nil {
-			log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
+	var nodeID uint32
+	var pwFd *os.File
+	var dbusConn *dbus.Conn
+	var virtualCleanup func() error
+	var err error
+	if cfg.ScreenID == "virtual" {
+		nodeID, dbusConn, virtualCleanup, err = requestMutterVirtualScreen(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		requestToken := waylandRequestToken(cfg)
+		var restoreToken string
+		nodeID, pwFd, dbusConn, restoreToken, err = requestScreencast(ctx, requestToken)
+		if err != nil {
+			return nil, fmt.Errorf("screencast portal: %w", err)
+		}
+		if restoreToken != "" && cfg.SaveRestoreToken != nil {
+			if err := cfg.SaveRestoreToken(restoreToken); err != nil {
+				log.Printf("[CAPTURE] warning: failed to save screencast restore token: %v", err)
+			}
 		}
 	}
 	dbg("pipewire node ID: %d", nodeID)
@@ -130,17 +138,28 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	if !vapostprocOK {
 		log.Printf("[CAPTURE] vapostproc not available (VA-API driver not working); falling back to videoconvert only, which may show a black screen on some drivers")
 	}
-	const pwFdNum = 3
-	gstArgs := buildWaylandGstArgs(pwFdNum, nodeID, fps, encoderParts, vapostprocOK)
+	pwFdNum := -1
+	if pwFd != nil {
+		pwFdNum = 3
+	}
+	virtualW, virtualH := 0, 0
+	if cfg.ScreenID == "virtual" {
+		virtualW, virtualH = virtualScreenWidth, virtualScreenHeight
+	}
+	gstArgs := buildWaylandGstArgs(pwFdNum, nodeID, fps, encoderParts, vapostprocOK, virtualW, virtualH)
 
 	dbg("[CAPTURE] gst-launch-1.0 (wayland) %s", strings.Join(gstArgs, " "))
 	cmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
-	cmd.ExtraFiles = []*os.File{pwFd}
+	if pwFd != nil {
+		cmd.ExtraFiles = []*os.File{pwFd}
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		pwFd.Close()
+		if pwFd != nil {
+			pwFd.Close()
+		}
 		dbusConn.Close()
 		return nil, fmt.Errorf("gst stdout pipe: %w", err)
 	}
@@ -148,21 +167,26 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 
 	if err := cmd.Start(); err != nil {
 		cancel()
-		pwFd.Close()
+		if pwFd != nil {
+			pwFd.Close()
+		}
 		dbusConn.Close()
 		return nil, fmt.Errorf("start gst-launch: %w", err)
 	}
-	pwFd.Close() // child inherited it
+	if pwFd != nil {
+		pwFd.Close() // child inherited it
+	}
 
 	go logStderr("GST", stderr)
 
 	capture := &ScreenCapture{
-		cmd:      cmd,
-		stdout:   stdout,
-		cancel:   cancel,
-		pwNodeID: nodeID,
-		dbusConn: dbusConn,
-		waitCh:   make(chan struct{}),
+		cmd:            cmd,
+		stdout:         stdout,
+		cancel:         cancel,
+		pwNodeID:       nodeID,
+		dbusConn:       dbusConn,
+		waitCh:         make(chan struct{}),
+		virtualCleanup: virtualCleanup,
 	}
 	go func() {
 		capture.waitErr = cmd.Wait()
@@ -183,33 +207,55 @@ func vapostprocAvailable() bool {
 
 // buildWaylandGstArgs assembles the gst-launch-1.0 pipeline that captures
 // from the PipeWire portal and encodes to H.264.
+//
 //   - vapostproc imports the portal's DMA-BUF via VA-API (plain videoconvert
 //     fails to negotiate DMA-BUF on many drivers, giving a black screen); it
 //     is only included when vapostprocOK, since on some drivers the element
 //     isn't registered at all and gst-launch would fail outright.
+//
 //   - format=I420 forces 4:2:0 — RGB screens otherwise make x264enc emit
 //     "High 4:4:4 Predictive", which most receiver decoders reject (black).
+//
 //   - pipewiresrc keepalive-time periodically emits the most recent buffer.
 //     Wayland compositors may otherwise stop producing buffers when a monitor
 //     has no pointer or visual damage, which makes receiver playback appear to
 //     pause until the pointer moves over that monitor.
+//
 //   - videorate re-stamps buffers onto a regular fps timeline: the portal can
 //     deliver pts=0, which confuses encoder/muxer timing. drop-only=true avoids
 //     introducing additional duplicates; skip-to-first avoids buffering before
 //     the first frame.
 //
-// The stream is encoded at the portal's native resolution; we do not rescale
-// because the captured surface size is whatever the compositor hands us. The
-// actual encoded dimensions are read back from the H.264 SPS downstream.
-func buildWaylandGstArgs(pwFdNum int, nodeID uint32, fps int, encoderParts encoderResult, vapostprocOK bool) []string {
+//   - width/height are only set for a created virtual display (Mutter's
+//     RecordVirtual stream sizes its virtual monitor from the format the
+//     client negotiates, so the caps must pin the resolution). Mutter needs
+//     variable-rate input (framerate=0/1) with max-framerate for its refresh
+//     rate; fixed-rate caps fail negotiation. BGRx is converted to I420
+//     downstream. A zero width/height means the
+//     stream keeps whatever size the portal/compositor hands over.
+//
+// The stream is encoded at the captured surface's native resolution; we do not
+// rescale because the captured surface size is whatever the compositor hands
+// us. The actual encoded dimensions are read back from the H.264 SPS downstream.
+func buildWaylandGstArgs(pwFdNum int, nodeID uint32, fps int, encoderParts encoderResult, vapostprocOK bool, width, height int) []string {
 	gstArgs := []string{
+		"-q", // stdout carries only the H.264 stream.
 		"pipewiresrc",
-		fmt.Sprintf("fd=%d", pwFdNum),
+	}
+	if pwFdNum >= 0 {
+		gstArgs = append(gstArgs, fmt.Sprintf("fd=%d", pwFdNum))
+	}
+	gstArgs = append(gstArgs,
 		fmt.Sprintf("path=%d", nodeID),
 		"do-timestamp=true",
 		"automatic-eos=false",
 		"on-disconnect=error",
 		fmt.Sprintf("keepalive-time=%d", max(1, 1000/fps)),
+	)
+	if width > 0 && height > 0 {
+		gstArgs = append(gstArgs,
+			"!", fmt.Sprintf("video/x-raw,format=BGRx,width=%d,height=%d,framerate=0/1,max-framerate=%d/1", width, height, fps),
+		)
 	}
 	if vapostprocOK {
 		gstArgs = append(gstArgs, "!", "vapostproc")
@@ -374,6 +420,15 @@ func (sc *ScreenCapture) Stop() {
 		sc.stdout.Close()
 	}
 
+	// Tear down a created virtual display before dropping its D-Bus session:
+	// the Mutter session Stop() (and X11 xrandr rollback) both need the
+	// connection/session still alive.
+	if sc.virtualCleanup != nil {
+		if err := sc.virtualCleanup(); err != nil {
+			log.Printf("[CAPTURE] warning: failed to tear down virtual monitor: %v", err)
+		}
+	}
+
 	if sc.dbusConn != nil {
 		sc.dbusConn.Close()
 	}
@@ -389,12 +444,6 @@ func (sc *ScreenCapture) Stop() {
 			_ = sc.cmd.Process.Kill()
 		}
 		<-sc.waitCh
-	}
-
-	if sc.virtualCleanup != nil {
-		if err := sc.virtualCleanup(); err != nil {
-			log.Printf("[CAPTURE] warning: failed to tear down virtual monitor: %v", err)
-		}
 	}
 }
 
@@ -838,7 +887,7 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 	gstArgs := []string{
 		"--quiet",
 		"videotestsrc", "pattern=18", "is-live=true", "do-timestamp=true",
-		"!", fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps),
+		"!", fmt.Sprintf("video/x-raw,format=BGRx,width=%d,height=%d,framerate=0/1,max-framerate=%d/1", testCaptureWidth, testCaptureHeight, fps),
 		"!", "timeoverlay",
 		"!", "videoconvert",
 		"!", "x264enc",
@@ -1124,6 +1173,127 @@ func requestScreencast(ctx context.Context, restoreToken string) (uint32, *os.Fi
 	}
 
 	return nodeID, os.NewFile(uintptr(pwFD), "pipewire-remote"), conn, newRestoreToken, nil
+}
+
+// SupportsWaylandVirtualDisplay checks the running compositor rather than
+// inferring support from desktop environment names.
+func SupportsWaylandVirtualDisplay() bool {
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var version dbus.Variant
+	err = conn.Object("org.gnome.Mutter.ScreenCast", "/org/gnome/Mutter/ScreenCast").
+		CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0,
+			"org.gnome.Mutter.ScreenCast", "Version").Store(&version)
+	if err != nil {
+		return false
+	}
+	v, ok := version.Value().(int32)
+	return ok && v >= 4
+}
+
+// requestMutterVirtualScreen creates a virtual monitor via Mutter's private
+// ScreenCast API (org.gnome.Mutter.ScreenCast) and records it as a PipeWire
+// stream, returning the PipeWire node ID to capture from. Unlike the
+// xdg-desktop-portal path this needs no interactive picker and no PipeWire fd:
+// the stream lives on the user's regular PipeWire instance, and Mutter sizes
+// the virtual monitor from the video format our pipewiresrc negotiates — so
+// the width/height/framerate must be pinned by pipeline caps (see
+// buildWaylandGstArgs).
+//
+// The returned cleanup func stops the screen cast session, which tears the
+// virtual monitor back down. The returned D-Bus connection must stay open for
+// the lifetime of the capture and is closed by ScreenCapture.Stop.
+//
+// This API is private and explicitly unstable across Mutter versions. It
+// requires the Mutter ScreenCast API on a GNOME Wayland session; any failure returns an
+// actionable error naming the supported alternatives (Xorg dummy output, or
+// GNOME Remote Desktop's extend mode).
+func requestMutterVirtualScreen(ctx context.Context) (nodeID uint32, conn *dbus.Conn, cleanup func() error, err error) {
+	conn, err = dbus.ConnectSessionBus()
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("connect session bus: %w", err)
+	}
+	fail := func(err error) (uint32, *dbus.Conn, func() error, error) {
+		conn.Close()
+		return 0, nil, nil, err
+	}
+
+	const (
+		service = "org.gnome.Mutter.ScreenCast"
+		objPath = "/org/gnome/Mutter/ScreenCast"
+	)
+	cast := conn.Object(service, objPath)
+
+	var sessionPath dbus.ObjectPath
+	if call := cast.Call(service+".CreateSession", 0, map[string]dbus.Variant{}); call.Err != nil {
+		return fail(fmt.Errorf("create Mutter screen cast session (an extended virtual display needs a GNOME Wayland session with the Mutter ScreenCast API; on other desktops use an Xorg session with a dummy output, or GNOME Remote Desktop's extend mode): %w", call.Err))
+	} else if err := call.Store(&sessionPath); err != nil {
+		return fail(fmt.Errorf("store Mutter session path: %w", err))
+	}
+	dbg("mutter screen cast session: %s", sessionPath)
+
+	sessionIface := "org.gnome.Mutter.ScreenCast.Session"
+	session := conn.Object(service, sessionPath)
+
+	var streamPath dbus.ObjectPath
+	if call := session.Call(sessionIface+".RecordVirtual", 0, map[string]dbus.Variant{
+		"cursor-mode": dbus.MakeVariant(uint32(1)), // EMBEDDED: composite cursor into the stream
+		"is-platform": dbus.MakeVariant(true),
+	}); call.Err != nil {
+		return fail(fmt.Errorf("mutter RecordVirtual: %w", call.Err))
+	} else if err := call.Store(&streamPath); err != nil {
+		return fail(fmt.Errorf("store Mutter stream path: %w", err))
+	}
+	dbg("mutter virtual stream: %s", streamPath)
+
+	// The PipeWire node id is delivered asynchronously via the
+	// PipeWireStreamAdded signal once the session is started, so subscribe
+	// before calling Start().
+	ch := make(chan *dbus.Signal, 4)
+	conn.Signal(ch)
+	defer conn.RemoveSignal(ch)
+	matchRule := fmt.Sprintf(
+		"type='signal',interface='%s.Stream',member='PipeWireStreamAdded',path='%s'",
+		service, streamPath)
+	if call := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchRule); call.Err != nil {
+		return fail(fmt.Errorf("add PipeWireStreamAdded match: %w", call.Err))
+	}
+	if call := session.Call(sessionIface+".Start", 0); call.Err != nil {
+		conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+		return fail(fmt.Errorf("mutter screen cast Start: %w", call.Err))
+	}
+
+	select {
+	case sig := <-ch:
+		conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+		if sig.Path != streamPath || len(sig.Body) < 1 {
+			return fail(fmt.Errorf("unexpected PipeWireStreamAdded signal from %s", sig.Path))
+		}
+		var ok bool
+		nodeID, ok = sig.Body[0].(uint32)
+		if !ok {
+			return fail(fmt.Errorf("unexpected PipeWire node id type: %T", sig.Body[0]))
+		}
+	case <-time.After(10 * time.Second):
+		conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+		return fail(fmt.Errorf("timeout waiting for Mutter virtual PipeWire stream"))
+	case <-ctx.Done():
+		conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+		return fail(fmt.Errorf("timeout waiting for Mutter virtual PipeWire stream: %w", ctx.Err()))
+	}
+
+	cleanup = func() error {
+		if call := session.Call(sessionIface+".Stop", 0); call.Err != nil {
+			return fmt.Errorf("stop Mutter screen cast session: %w", call.Err)
+		}
+		return nil
+	}
+	return nodeID, conn, cleanup, nil
 }
 
 func waitForResponseWithResult(ctx context.Context, conn *dbus.Conn, requestHandle dbus.ObjectPath) (map[string]dbus.Variant, error) {
